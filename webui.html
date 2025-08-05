@@ -1,0 +1,283 @@
+<!--
+To test this UI, open the following file in your browser:
+
+file:///C:/Users/AxelC/OneDrive/Desktop/Flamewerks%20App/webui.html
+
+Or, if hosted on your ESP8266, connect your device to the ESP Wi-Fi and visit:
+
+http://192.168.4.1/webui.html
+
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Burner Control Panel</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f5f5f5; }
+    .container { max-width: 700px; margin: 0 auto; padding: 1em; }
+    h1 { text-align: center; }
+    .master-switch {
+      display: flex; justify-content: center; align-items: center; margin: 1em 0;
+    }
+    .master-switch label {
+      font-size: 1.2em; margin-right: 1em;
+    }
+    .switch {
+      position: relative; display: inline-block; width: 60px; height: 34px;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #ccc; transition: .4s; border-radius: 34px;
+    }
+    .slider:before {
+      position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px;
+      background-color: white; transition: .4s; border-radius: 50%;
+    }
+    input:checked + .slider { background-color: #4CAF50; }
+    input:checked + .slider:before { transform: translateX(26px); }
+    .burner-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1em;
+      margin-top: 1.5em;
+      justify-items: center;
+    }
+    .burner-box {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      width: 90px;
+      height: 90px;
+      border-radius: 12px;
+      color: #fff;
+      font-weight: bold;
+      font-size: 1.1em;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+      user-select: none;
+      cursor: pointer;
+      border: 2px solid transparent;
+      transition: border 0.2s, box-shadow 0.2s;
+      margin: 0;
+    }
+    .burner-on-ok { background: #43a047; }
+    .burner-off { background: #b71c1c; }
+    .burner-unknown { background: #888; }
+    .burner-selected { border: 2px solid #1976d2; box-shadow: 0 0 0 2px #1976d2; }
+    .burner-label { font-size: 0.9em; margin-top: 0.3em; }
+    @media (max-width: 600px) {
+      .container { padding: 0.2em; }
+      .burner-box { font-size: 1em; height: 70px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Burner Control Panel</h1>
+    <div class="master-switch">
+      <label for="masterSwitch">Master Switch</label>
+      <label class="switch">
+        <input type="checkbox" id="masterSwitch" onchange="toggleMasterSwitch(this)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div id="burnerGrid" class="burner-grid"></div>
+  </div>
+  <script>
+    // --- Configuration ---
+    const NUM_BURNERS = 8; // Change as needed
+    const API_BASE = location.origin;
+
+    // --- State ---
+    let burners = Array.from({length: NUM_BURNERS}, (_, i) => ({
+      id: i+1,
+      state: 'off',
+      lastCommand: null,
+      ignitionStart: null
+    }));
+    let selectedBurners = new Set();
+    let isDragging = false;
+    let dragCommand = null;
+
+    // Fetch all burner statuses from backend
+    async function fetchStatus() {
+      try {
+        const res = await fetch(`${API_BASE}/status`);
+        if (!res.ok) throw new Error("Status fetch failed");
+        // Expecting: [{id:1,state:'on'|'off'|'igniting'}, ...]
+        return await res.json();
+      } catch (e) {
+        // fallback: all off
+        return Array.from({length: NUM_BURNERS}, (_, i) => ({
+          id: i+1, state: 'off'
+        }));
+      }
+    }
+
+    // Send command to a group of burners, with 3s delay per group of 4
+    async function sendCommand(burnerIds, command) {
+      if (!Array.isArray(burnerIds)) burnerIds = [burnerIds];
+      for (let i = 0; i < burnerIds.length; i += 4) {
+        const group = burnerIds.slice(i, i + 4);
+        await fetch(`${API_BASE}/control`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `cmd=${encodeURIComponent(command)}&ids=${group.join(',')}`
+        });
+        // Mark as igniting for UI feedback
+        group.forEach(id => {
+          const b = burners.find(b => b.id === id);
+          if (b && command === 'on') {
+            b.state = 'igniting';
+            b.ignitionStart = Date.now();
+          }
+        });
+        if (i + 4 < burnerIds.length) await new Promise(res => setTimeout(res, 3000));
+      }
+      setTimeout(updateGrid, 300);
+    }
+
+    // Master switch handler
+    function toggleMasterSwitch(el) {
+      sendCommand(Array.from({length: NUM_BURNERS}, (_, i) => i+1), el.checked ? 'on' : 'off');
+    }
+
+    // Render the burners grid
+    async function updateGrid() {
+      const statusArr = await fetchStatus();
+      // Merge status into local burners array for ignition animation
+      burners.forEach((b, idx) => {
+        const s = statusArr.find(x => x.id === b.id);
+        if (s) {
+          // If we were "igniting" and now "on" or "off", clear ignition animation
+          if (b.state === 'igniting' && (s.state === 'on' || s.state === 'off')) {
+            b.ignitionStart = null;
+          }
+          b.state = s.state;
+        }
+      });
+
+      const grid = document.getElementById('burnerGrid');
+      grid.innerHTML = '';
+      let allOn = true;
+      burners.forEach(burner => {
+        let boxClass = 'burner-box ';
+        // Blinking green for igniting
+        if (burner.state === 'igniting') {
+          const blink = Math.floor(Date.now() / 400) % 2 === 0;
+          boxClass += blink ? 'burner-on-ok' : 'burner-off';
+          allOn = false;
+        } else if (burner.state === 'on') {
+          boxClass += 'burner-on-ok';
+        } else if (burner.state === 'off') {
+          boxClass += 'burner-off';
+          allOn = false;
+        } else {
+          boxClass += 'burner-unknown';
+          allOn = false;
+        }
+        if (selectedBurners.has(burner.id)) boxClass += ' burner-selected';
+
+        const div = document.createElement('div');
+        div.className = boxClass;
+        div.dataset.burnerId = burner.id;
+        
+        let statusText = '';
+        if (burner.state === 'igniting') {
+          statusText = 'SPARK + PILOT';
+        } else if (burner.state === 'on') {
+          statusText = 'FLAME OK';
+        } else if (burner.state === 'off') {
+          statusText = 'OFF';
+        } else {
+          statusText = burner.state.toUpperCase();
+        }
+
+        div.innerHTML = `
+          <div>Burner ${burner.id}</div>
+          <div>${statusText}</div>
+        `;
+        // Touch/mouse events for drag selection
+        div.addEventListener('mousedown', e => startDrag(burner.id, burner.state));
+        div.addEventListener('mouseenter', e => dragOver(burner.id));
+        div.addEventListener('mouseup', endDrag);
+        div.addEventListener('touchstart', e => { e.preventDefault(); startDrag(burner.id, burner.state); });
+        div.addEventListener('touchmove', e => {
+          const touch = e.touches[0];
+          const elem = document.elementFromPoint(touch.clientX, touch.clientY);
+          if (elem && elem.classList.contains('burner-box')) {
+            dragOver(Number(elem.dataset.burnerId));
+          }
+        });
+        div.addEventListener('touchend', endDrag);
+        div.onclick = () => sendCommand(burner.id, burner.state === 'on' ? 'off' : 'on');
+        grid.appendChild(div);
+      });
+      document.getElementById('masterSwitch').checked = allOn;
+    }
+
+    // Drag selection logic
+    function startDrag(burnerId, state) {
+      isDragging = true;
+      dragCommand = state === 'on' ? 'off' : 'on';
+      selectedBurners.clear();
+      selectedBurners.add(burnerId);
+      updateGridHighlight();
+      document.addEventListener('mouseup', endDrag);
+      document.addEventListener('mousemove', mouseDragOver);
+    }
+    function dragOver(burnerId) {
+      if (isDragging) {
+        selectedBurners.add(burnerId);
+        updateGridHighlight();
+      }
+    }
+    function mouseDragOver(e) {
+      const elem = document.elementFromPoint(e.clientX, e.clientY);
+      if (elem && elem.classList.contains('burner-box')) {
+        dragOver(Number(elem.dataset.burnerId));
+      }
+    }
+    function endDrag() {
+      if (isDragging && selectedBurners.size > 0) {
+        sendCommand(Array.from(selectedBurners), dragCommand);
+      }
+      isDragging = false;
+      dragCommand = null;
+      selectedBurners.clear();
+      updateGridHighlight();
+      document.removeEventListener('mouseup', endDrag);
+      document.removeEventListener('mousemove', mouseDragOver);
+    }
+    function updateGridHighlight() {
+      document.querySelectorAll('.burner-box').forEach(box => {
+        if (selectedBurners.has(Number(box.dataset.burnerId))) {
+          box.classList.add('burner-selected');
+        } else {
+          box.classList.remove('burner-selected');
+        }
+      });
+    }
+
+    // Auto-refresh every 2 seconds
+    setInterval(updateGrid, 2000);
+    updateGrid();
+
+    // In the current UI, clicking a red (OFF) square calls:
+    //   sendCommand(burner.id, 'on')
+    // This sends a POST to /control with cmd=on&ids=<id>.
+
+    // If your backend firmware is not running or not connected, or if the /control endpoint does not handle the 'ids' parameter or multiple burners, the UI will not trigger ignition.
+
+    // If you have no hardware or firmware running, nothing will happen. 
+    // If you have hardware/firmware running, but it only supports a single burner or does not parse the 'ids' parameter, the command will not work as expected.
+
+    // To test the UI with no hardware, you need a backend that responds to /control and /status as expected.
+
+    // If you want to test the UI logic only, you can temporarily mock fetchStatus and sendCommand to simulate burner state changes in the browser.
+  </script>
+</body>
+</html>
