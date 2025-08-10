@@ -9,8 +9,15 @@
  * Current Hardware Configuration (TESTING):
  * GPIO 2  -> Pilot Valve Relay (via PC817 optocoupler) [ACTIVE]
  * GPIO 4  -> Beefcake Relay -> 12V Glow Plug Control [ACTIVE]
- * GPIO 5  -> Flame Rod Output (AC voltage to flame rod probe) [ACTIVE]
+ * GPIO 5  -> Flame Rod Bias (PWM for rectification) [ACTIVE]
  * A0      -> Flame Rod Input (via 1MΩ resistor - flame rectification) [ACTIVE]
+ * 
+ * IMPORTANT NOTE ON FLAME ROD CONNECTION FOR ACCURATE SENSING:
+ * - Connect GPIO5 directly to the flame rod (the end not in the flame).
+ * - Connect the flame rod to A0 via 1MΩ resistor.
+ * - Remove any low-value resistor (e.g., 220 ohm) to ground, as it shunts the signal.
+ * - The ground path completes through the flame to a grounded burner/chassis.
+ * - For lighter testing: Connect ESP GND to lighter's metal body to close the circuit.
  * 
  *  STANDARD PRODUCTION CONFIGURATION (when you get 2nd relay):
  *  GPIO 2  -> Pilot Valve Relay (via PC817 optocoupler)
@@ -24,8 +31,8 @@
  *  3. MAIN_ON: Open main valve for full operation
  *  
  *  Testing Operation (Current):
- *  1. PILOT_IGNITING: Open pilot valve + igniter spark
- *  2. PILOT_ON: Pilot flame detected, stay in pilot mode
+ *  1. PILOT_IGNITING: Open pilot valve + glow plug on
+ *  2. PILOT_ON: Pilot flame detected, stay in pilot mode, glow plug off
  *  3. Main valve commands are logged but not executed
  
  * 
@@ -121,6 +128,7 @@ void setMainValve(bool state) {
 // Glow plug control function (using pin 4)
 void setGlowPlug(bool state) {
   digitalWrite(MAIN_RELAY_PIN, state ? HIGH : LOW);  // Pin 4 controls glow plug circuit
+  burner.igniterActive = state;
   Serial.print("Glow plug (Pin 4): ");
   Serial.println(state ? "ON (3.3V signal -> 12V glow plug)" : "OFF (0V signal -> glow plug off)");
   Serial.println("   NOTE: Pin 4 outputs 3.3V to control relay/MOSFET that switches 12V to glow plug");
@@ -129,18 +137,10 @@ void setGlowPlug(bool state) {
 void emergencyShutdown() {
   setPilotValve(false);
   setMainValve(false);
+  setGlowPlug(false);
   burner.state = OFF;
   burner.retryAttempt = 0;
   Serial.println("*** EMERGENCY SHUTDOWN - ALL SYSTEMS OFF ***");
-}
-
-void setFlameRodOutput(bool state) {
-  digitalWrite(FLAME_ROD_OUT_PIN, state ? HIGH : LOW);
-}
-
-void setFlameRodOutputLevel(int level) {
-  int pwmValue = map(level, 0, 4, 0, 1023);
-  analogWrite(FLAME_ROD_OUT_PIN, pwmValue);
 }
 
 bool readFlameStatus() {
@@ -252,7 +252,7 @@ bool readFlameStatus() {
   // Report state changes immediately
   if (newFlameState != lastStableFlame) {
     if (newFlameState) {
-      Serial.print("\xF0\x9F\x94\xA5 STABLE FLAME DETECTED! Filtered ADC: ");
+      Serial.print("🔥 STABLE FLAME DETECTED! Filtered ADC: ");
       Serial.print(filteredReading);
       Serial.print(" (Raw: ");
       Serial.print(rawReading);
@@ -260,9 +260,9 @@ bool readFlameStatus() {
       Serial.print(noiseLevel);
       Serial.print(", Threshold: ");
       Serial.print(FLAME_DETECTION_THRESHOLD);
-      Serial.println(") \xF0\x9F\x94\xA5");
+      Serial.println(") 🔥");
     } else {
-      Serial.print("\xE2\x9D\x84\xEF\xB8\x8F STABLE FLAME LOST - Filtered ADC: ");
+      Serial.print("❄️ STABLE FLAME LOST - Filtered ADC: ");
       Serial.print(filteredReading);
       Serial.print(" (Raw: ");
       Serial.print(rawReading);
@@ -270,7 +270,7 @@ bool readFlameStatus() {
       Serial.print(noiseLevel);
       Serial.print(", Below threshold: ");
       Serial.print(FLAME_DETECTION_THRESHOLD);
-      Serial.println(") \xE2\x9D\x84\xEF\xB8\x8F");
+      Serial.println(") ❄️");
     }
     lastStableFlame = newFlameState;
   }
@@ -287,7 +287,7 @@ bool readFlameStatus() {
     Serial.print(" | Threshold: ");
     Serial.print(FLAME_DETECTION_THRESHOLD);
     Serial.print(" | Flame: ");
-    Serial.print(newFlameState ? "\xF0\x9F\x94\xA5 YES" : "\xE2\x9D\x84\xEF\xB8\x8F NO");
+    Serial.print(newFlameState ? "🔥 YES" : "❄️ NO");
     Serial.print(" | Stability: ");
     Serial.print(isStable ? "STABLE" : "NOISY");
     if (filteredReading >= 1020) {
@@ -331,18 +331,21 @@ void updateBurnerStateMachine() {
       // Phase 1: Open pilot valve (flame rod is passive receiver only)
       setPilotValve(true);
       setMainValve(false);
+      setGlowPlug(true); // Activate glow plug for ignition
       
       if (burner.flameDetected) {
         // Pilot flame established! (Testing mode - stay in pilot)
         burner.state = PILOT_ON;  // Modified for testing
         burner.stateStartTime = currentTime;
         burner.retryAttempt = 0;  // Reset retry counter
+        setGlowPlug(false); // Turn off glow plug after flame detected
         Serial.println("STATE: Pilot flame detected via flame rod -> PILOT_ON (TESTING MODE)");
         Serial.println("   --> In production mode, this would proceed to main valve");
       } 
       else if (currentTime - burner.stateStartTime > PILOT_IGNITION_TIME_MS) {
         // Ignition timeout
         setPilotValve(false);
+        setGlowPlug(false);
         
         if (burner.retryAttempt < MAX_IGNITION_ATTEMPTS) {
           burner.retryAttempt++;
@@ -689,7 +692,7 @@ void handleSerialCommands() {
         Serial.print(" | Noise=");
         Serial.print(abs(avgRaw - filteredReading));
         Serial.print(" | ");
-        Serial.print(currentFlame ? "\xF0\x9F\x94\xA5 FLAME" : "\xE2\x9D\x84\xEF\xB8\x8F none ");
+        Serial.print(currentFlame ? "🔥 FLAME" : "❄️ none ");
         
         // Show when flame status changes
         if (currentFlame != lastFlameState) {
@@ -871,158 +874,6 @@ void handleSerialCommands() {
       }
       Serial.println("=============================");
     }
-    else if (cmd == "flame_cal" || cmd == "fc") {
-      calibrateFlameRod();
-    }
-    else if (cmd == "flame_continuous" || cmd == "fcon") {
-      Serial.println("=== CONTINUOUS FLAME MONITORING ===");
-      Serial.println("Press any key to stop...");
-      Serial.println("Format: Reading | Voltage | Status");
-      Serial.println("===================================");
-      
-      while (!Serial.available()) {
-        int reading = analogRead(FLAME_SENSE_PIN);
-        float voltage = (reading * 3.3) / 1024.0;
-        bool detected = reading > FLAME_DETECTION_THRESHOLD;
-        
-        Serial.print(reading);
-        Serial.print(" | ");
-        Serial.print(voltage, 2);
-        Serial.print("V | ");
-        Serial.println(detected ? "FLAME" : "NO FLAME");
-        delay(500);
-      }
-      // Clear the serial buffer
-      while (Serial.available()) Serial.read();
-      Serial.println("Continuous monitoring stopped.");
-    }
-    else if (cmd == "glow_on") {
-      Serial.println("=== GLOW PLUG ON ===");
-      setGlowPlug(true);
-      Serial.println("Pin 4 now outputs 3.3V to control your 12V glow plug circuit");
-      Serial.println("Check: 1) Pin 4 = 3.3V, 2) 12V supply to glow plug via relay/MOSFET");
-      Serial.println();
-      Serial.println("TROUBLESHOOTING CHECKLIST:");
-      Serial.println("□ Pin 4 measures 3.3V with multimeter");
-      Serial.println("□ Beefcake relay clicks/energizes when pin goes HIGH");
-      Serial.println("□ 12V power supply connected to relay input");
-      Serial.println("□ Glow plug connected to relay output contacts");
-      Serial.println("□ Glow plug gets 12V when relay is energized");
-      Serial.println("□ Glow plug starts heating within 30 seconds");
-    }
-    else if (cmd == "glow_off") {
-      Serial.println("=== GLOW PLUG OFF ===");
-      setGlowPlug(false);
-      Serial.println("Pin 4 now outputs 0V - glow plug should be OFF");
-      Serial.println("Check: 1) Pin 4 = 0V, 2) No 12V to glow plug");
-      Serial.println("□ Pin 4 measures 0V with multimeter");
-      Serial.println("□ Beefcake relay de-energizes (no click/power)");
-      Serial.println("□ No 12V to glow plug");
-    }
-    else if (cmd == "glow_test") {
-      Serial.println("=== GLOW PLUG TEST SEQUENCE ===");
-      Serial.println("This will test the glow plug control circuit");
-      Serial.println();
-      
-      Serial.println("Step 1: Turning glow plug OFF...");
-      setGlowPlug(false);
-      Serial.println("Measure: Pin 4 should be 0V, glow plug should be OFF");
-      Serial.println("Press any key to continue...");
-      while (!Serial.available()) delay(100);
-      while (Serial.available()) Serial.read();
-      
-      Serial.println();
-      Serial.println("Step 2: Turning glow plug ON...");
-      setGlowPlug(true);
-      Serial.println("Measure: Pin 4 should be 3.3V, glow plug should get 12V");
-      Serial.println("Check if glow plug is heating up!");
-      Serial.println("Press any key to continue...");
-      while (!Serial.available()) delay(100);
-      while (Serial.available()) Serial.read();
-      
-      Serial.println();
-      Serial.println("Step 3: 5-second ON test...");
-      Serial.println("Glow plug will stay ON for 5 seconds");
-      for (int i = 5; i > 0; i--) {
-        Serial.print("Glow plug ON - ");
-        Serial.print(i);
-        Serial.println(" seconds remaining");
-        delay(1000);
-      }
-      
-      Serial.println();
-      Serial.println("Step 4: Turning glow plug OFF...");
-      setGlowPlug(false);
-      Serial.println("Glow plug test complete!");
-      Serial.println();
-      Serial.println("=== EXPECTED RESULTS ===");
-      Serial.println("- Pin 4: 0V=OFF, 3.3V=ON");
-      Serial.println("- Glow plug: Should get 12V when ON");
-      Serial.println("- Glow plug should heat up when 12V applied");
-      Serial.println("- If no heating: check relay/MOSFET circuit");
-      Serial.println("========================");
-    }
-    else if (cmd == "pin_test") {
-      Serial.println("=== GPIO PIN TEST ===");
-      Serial.println("Testing all output pins individually...");
-      Serial.println();
-      
-      Serial.println("Testing Pin 2 (Pilot Valve):");
-      Serial.println("  Setting LOW...");
-      digitalWrite(PILOT_RELAY_PIN, LOW);
-      delay(1000);
-      Serial.print("  Pin 2 state: ");
-      Serial.println(digitalRead(PILOT_RELAY_PIN) ? "HIGH" : "LOW");
-      
-      Serial.println("  Setting HIGH...");
-      digitalWrite(PILOT_RELAY_PIN, HIGH);
-      delay(1000);
-      Serial.print("  Pin 2 state: ");
-      Serial.println(digitalRead(PILOT_RELAY_PIN) ? "HIGH" : "LOW");
-      digitalWrite(PILOT_RELAY_PIN, LOW); // Return to OFF
-      
-      Serial.println();
-      Serial.println("Testing Pin 4 (Glow Plug):");
-      Serial.println("  Setting LOW...");
-      digitalWrite(MAIN_RELAY_PIN, LOW);
-      delay(1000);
-      Serial.print("  Pin 4 state: ");
-      Serial.println(digitalRead(MAIN_RELAY_PIN) ? "HIGH" : "LOW");
-      Serial.println("  ** Check multimeter: Pin 4 should be 0V **");
-      
-      Serial.println("  Setting HIGH...");
-      digitalWrite(MAIN_RELAY_PIN, HIGH);
-      delay(2000);
-      Serial.print("  Pin 4 state: ");
-      Serial.println(digitalRead(MAIN_RELAY_PIN) ? "HIGH" : "LOW");
-      Serial.println("  ** Check multimeter: Pin 4 should be 3.3V **");
-      Serial.println("  ** Check beefcake relay: Should click and energize **");
-      digitalWrite(MAIN_RELAY_PIN, LOW); // Return to OFF
-      
-      Serial.println();
-      Serial.println("Testing Pin 5 (Flame Rod):");
-      Serial.println("  Setting LOW...");
-      digitalWrite(FLAME_ROD_OUT_PIN, LOW);
-      delay(1000);
-      Serial.print("  Pin 5 state: ");
-      Serial.println(digitalRead(FLAME_ROD_OUT_PIN) ? "HIGH" : "LOW");
-      
-      Serial.println("  Setting HIGH...");
-      digitalWrite(FLAME_ROD_OUT_PIN, HIGH);
-      delay(1000);
-      Serial.print("  Pin 5 state: ");
-      Serial.println(digitalRead(FLAME_ROD_OUT_PIN) ? "HIGH" : "LOW");
-      digitalWrite(FLAME_ROD_OUT_PIN, LOW); // Return to OFF
-      
-      Serial.println();
-      Serial.println("=== PIN TEST COMPLETE ===");
-      Serial.println("If Pin 4 shows correct voltages but glow plug doesn't work:");
-      Serial.println("1. Check beefcake relay wiring to Pin 4");
-      Serial.println("2. Check 12V power supply to relay");
-      Serial.println("3. Check glow plug connections through relay contacts");
-      Serial.println("4. Test glow plug directly with 12V (bypass relay)");
-      Serial.println("========================");
-    }
     else if (cmd.length() > 0) {
       Serial.println("Unknown command. Type 'help' for available commands.");
     }
@@ -1195,7 +1046,6 @@ void setup() {
   setPilotValve(false);
   setMainValve(false);
   setGlowPlug(false);  // Initialize glow plug to OFF
-  setFlameRodOutput(false);
   
   // Initialize burner controller
   burner.state = OFF;
@@ -1254,7 +1104,7 @@ void setup() {
   Serial.println("Web server started on port 80");
   
   Serial.println("\n=== System Ready ===");
-  Serial.println("Commands: i=ignite, s=stop, r=reset, status=st, help");
+  Serial.println("Commands: i=ignite, e=stop, r=reset, s=status, help");
   Serial.println("Web UI: http://" + WiFi.localIP().toString() + "/");
   Serial.println("========================\n");
 }
@@ -1387,7 +1237,7 @@ void calibrateFlameRod() {
     int reading = analogRead(FLAME_SENSE_PIN);
     Serial.print("Current reading: ");
     Serial.print(reading);
-    Serial.println(" (bring flame closer to rod)");
+    Serial.print(" (bring flame closer to rod)");
     delay(1000);
   }
   while (Serial.available()) Serial.read(); // Clear buffer
@@ -1451,5 +1301,110 @@ void calibrateFlameRod() {
   Serial.println("============================");
 }
 
-
-
+// --- Flame Rod Level Testing Function ---
+void testFlameRodLevels() {
+  Serial.println("\n=== FLAME ROD OUTPUT LEVEL TEST ===");
+  Serial.println("Testing different flame rod output levels...");
+  Serial.println("This simulates different flame intensities for sensor calibration");
+  Serial.println("Format: Level | Output | ADC Reading | Detected | Notes");
+  Serial.println("========================================================");
+  
+  // Test each level for 3 seconds with readings
+  int levels[] = {0, 1, 2, 3, 4};
+  String levelNames[] = {"OFF", "LOW", "MEDIUM", "HIGH", "FULL"};
+  String voltages[] = {"0V", "~0.8V", "~1.6V", "~2.5V", "3.3V"};
+  
+  for (int i = 0; i < 5; i++) {
+    Serial.print("\n--- Testing Level ");
+    Serial.print(levels[i]);
+    Serial.print(" (");
+    Serial.print(levelNames[i]);
+    Serial.print(" - ");
+    Serial.print(voltages[i]);
+    Serial.println(") ---");
+    
+    setFlameRodOutputLevel(levels[i]);
+    delay(500); // Let output stabilize
+    
+    // Take 5 readings over 2.5 seconds
+    int total = 0;
+    int maxReading = 0;
+    int minReading = 1024;
+    int detectedCount = 0;
+    
+    for (int j = 0; j < 5; j++) {
+      int reading = analogRead(FLAME_SENSE_PIN);
+      bool detected = reading > FLAME_DETECTION_THRESHOLD;
+      
+      total += reading;
+      if (reading > maxReading) maxReading = reading;
+      if (reading < minReading) minReading = reading;
+      if (detected) detectedCount++;
+      
+      Serial.print("  Reading ");
+      Serial.print(j + 1);
+      Serial.print(": ");
+      Serial.print(reading);
+      Serial.print(" | ");
+      Serial.print(detected ? "FLAME" : "none ");
+      
+      if (j == 0) {
+        // Add interpretation for first reading
+        if (levels[i] == 0 && reading < 20) {
+          Serial.print(" | GOOD: Good baseline");
+        } else if (levels[i] > 0 && reading > FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | GOOD: Good flame signal");
+        } else if (levels[i] > 0 && reading <= FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | WARNING: Weak signal");
+        }
+      }
+      Serial.println();
+      
+      delay(500);
+    }
+    
+    int average = total / 5;
+    Serial.print("  Summary - Avg: ");
+    Serial.print(average);
+    Serial.print(" | Range: ");
+    Serial.print(minReading);
+    Serial.print("-");
+    Serial.print(maxReading);
+    Serial.print(" | Detection: ");
+    Serial.print(detectedCount);
+    Serial.println("/5");
+    
+    // Analysis
+    if (levels[i] == 0) {
+      if (average < 30) {
+        Serial.println("  GOOD: Good baseline - low noise");
+      } else {
+        Serial.println("  WARNING: High baseline - check wiring");
+      }
+    } else {
+      int signalIncrease = average - 20; // Assume ~20 baseline
+      if (signalIncrease > 50) {
+        Serial.println("  GOOD: Strong signal increase");
+      } else if (signalIncrease > 20) {
+        Serial.println("  INFO: Moderate signal increase");
+      } else {
+        Serial.println("  PROBLEM: Weak signal - check circuit");
+      }
+    }
+  }
+  
+  Serial.println("\n=== TEST COMPLETE ===");
+  Serial.println("Analysis:");
+  Serial.println("- Level 0 should show low baseline readings");
+  Serial.println("- Higher levels should show increasing ADC values");
+  Serial.println("- Flame detection should trigger at higher levels");
+  Serial.println("- If all levels show similar readings, check:");
+  Serial.println("  * 1MΩ resistor connection");
+  Serial.println("  * A0 pin wiring");
+  Serial.println("  * GPIO5 output circuit");
+  
+  // Return to OFF state
+  setFlameRodOutputLevel(0);
+  Serial.println("\nFlame rod output returned to OFF");
+  Serial.println("=============================");
+}
