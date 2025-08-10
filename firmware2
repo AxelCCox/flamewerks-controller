@@ -50,8 +50,8 @@
 #define FLAME_SENSE_PIN  A0   // A0 -> Flame Rod Input via 1MΩ (rectification) [ACTIVE]
 
 // --- Configuration ---
-const char* ssid = "Axels iphone";        // Your iPhone hotspot
-const char* password = "password";        // Your WiFi password
+const char* ssid = "Velocity Wi-Fi";        // Updated WiFi name
+const char* password = "zpyvdzss";           // Updated WiFi password
 const char* hostname = "flamewerks-burner";
 
 // --- Burner State Machine (MODIFIED FOR SINGLE RELAY TESTING) ---
@@ -88,8 +88,13 @@ const unsigned long FLAME_CHECK_INTERVAL_MS = 100;   // Check flame every 100ms
 const unsigned long FLAME_LOSS_TIMEOUT_MS = 500;     // 500ms to detect flame loss
 const unsigned long COOLDOWN_PERIOD_MS = 3000;       // 3 second cooldown between attempts
 const int MAX_IGNITION_ATTEMPTS = 3;                 // Maximum retry attempts
-const int FLAME_DETECTION_THRESHOLD = 80;            // Lower threshold for flame rod (adjust based on testing)
-const int FLAME_HYSTERESIS = 10;                     // Prevent flickering around threshold
+const int FLAME_DETECTION_THRESHOLD = 25;            // Lowered from 50 for better flame sensitivity
+const int FLAME_HYSTERESIS = 3;                      // Reduced hysteresis for faster response
+
+// --- Signal Filtering Parameters ---
+const int FILTER_SAMPLES = 8;                        // Number of samples to average
+const int STABILITY_REQUIRED = 3;                    // Consecutive stable readings required
+const int MAX_NOISE_TOLERANCE = 15;                  // Maximum ADC variation to consider "stable"
 
 // --- Web Server ---
 ESP8266WebServer server(80);
@@ -121,57 +126,7 @@ void setGlowPlug(bool state) {
   Serial.println("   NOTE: Pin 4 outputs 3.3V to control relay/MOSFET that switches 12V to glow plug");
 }
 
-void setFlameRodOutput(bool state) {
-  digitalWrite(FLAME_ROD_OUT_PIN, state ? HIGH : LOW);
-  Serial.print("Flame rod output: ");
-  Serial.println(state ? "ACTIVE (3.3V)" : "OFF (0V)");
-}
-
-// Enhanced flame rod output with PWM for testing different levels
-void setFlameRodOutputLevel(int level) {
-  // level: 0=OFF, 1=LOW(25%), 2=MEDIUM(50%), 3=HIGH(75%), 4=FULL(100%)
-  int pwmValue = 0;
-  String levelName = "";
-  
-  switch(level) {
-    case 0: 
-      pwmValue = 0; 
-      levelName = "OFF (0V)"; 
-      break;
-    case 1: 
-      pwmValue = 64;  // 25% of 255
-      levelName = "LOW (~0.8V)"; 
-      break;
-    case 2: 
-      pwmValue = 128; // 50% of 255
-      levelName = "MEDIUM (~1.6V)"; 
-      break;
-    case 3: 
-      pwmValue = 192; // 75% of 255
-      levelName = "HIGH (~2.5V)"; 
-      break;
-    case 4: 
-      pwmValue = 255; // 100%
-      levelName = "FULL (3.3V)"; 
-      break;
-    default:
-      pwmValue = 0;
-      levelName = "INVALID - OFF";
-      break;
-  }
-  
-  analogWrite(FLAME_ROD_OUT_PIN, pwmValue);
-  Serial.print("Flame rod test output: Level ");
-  Serial.print(level);
-  Serial.print(" - ");
-  Serial.print(levelName);
-  Serial.print(" (PWM: ");
-  Serial.print(pwmValue);
-  Serial.println(")");
-}
-
 void emergencyShutdown() {
-  setFlameRodOutput(false);
   setPilotValve(false);
   setMainValve(false);
   burner.state = OFF;
@@ -180,19 +135,52 @@ void emergencyShutdown() {
 }
 
 bool readFlameStatus() {
-  int reading = analogRead(FLAME_SENSE_PIN);
-  burner.lastFlameReading = reading;
+  // Multi-sample averaging for noise reduction
+  static int sampleBuffer[FILTER_SAMPLES];
+  static int sampleIndex = 0;
+  static bool bufferFilled = false;
+  static int stableFlameCount = 0;
+  static int stableNoFlameCount = 0;
+  static bool lastStableFlame = false;
   
-  // Enhanced floating pin detection
+  // Take current reading
+  int rawReading = analogRead(FLAME_SENSE_PIN);
+  
+  // Fill circular buffer
+  sampleBuffer[sampleIndex] = rawReading;
+  sampleIndex = (sampleIndex + 1) % FILTER_SAMPLES;
+  if (!bufferFilled && sampleIndex == 0) {
+    bufferFilled = true;
+  }
+  
+  // Calculate filtered reading (average of samples)
+  int total = 0;
+  int samplesUsed = bufferFilled ? FILTER_SAMPLES : sampleIndex;
+  for (int i = 0; i < samplesUsed; i++) {
+    total += sampleBuffer[i];
+  }
+  int filteredReading = total / samplesUsed;
+  
+  // Calculate noise level (standard deviation approximation)
+  int maxSample = 0, minSample = 1024;
+  for (int i = 0; i < samplesUsed; i++) {
+    if (sampleBuffer[i] > maxSample) maxSample = sampleBuffer[i];
+    if (sampleBuffer[i] < minSample) minSample = sampleBuffer[i];
+  }
+  int noiseLevel = maxSample - minSample;
+  
+  // Store for debugging
+  burner.lastFlameReading = filteredReading;
+  
+  // Enhanced floating pin detection (using filtered reading)
   static int consecutiveMaxReadings = 0;
   static int consecutiveMinReadings = 0;
   static bool hasWarnedFloating = false;
   
-  // Track consecutive max readings (indicating floating pin)
-  if (reading >= 1020) {
+  if (filteredReading >= 1020) {
     consecutiveMaxReadings++;
     consecutiveMinReadings = 0;
-  } else if (reading <= 10) {
+  } else if (filteredReading <= 10) {
     consecutiveMinReadings++;
     consecutiveMaxReadings = 0;
   } else {
@@ -200,75 +188,121 @@ bool readFlameStatus() {
     consecutiveMinReadings = 0;
   }
   
-  // Warn about floating A0 pin
+  // Floating pin warnings
   if (consecutiveMaxReadings >= 3 && !hasWarnedFloating) {
     Serial.println("*** WARNING: A0 PIN FLOATING! ***");
     Serial.println("ADC reading stuck at maximum (1024) - A0 not properly connected");
     Serial.println("CHECK: 1MΩ resistor from A0 to GND, flame rod to A0 connection");
-    Serial.println("This will cause false flame detection!");
     hasWarnedFloating = true;
   }
   
-  // Reset warning when pin stabilizes
   if (consecutiveMinReadings >= 5 && hasWarnedFloating) {
     Serial.println("*** A0 PIN STABILIZED - Good baseline readings ***");
     hasWarnedFloating = false;
   }
   
-  // Implement hysteresis to prevent flicker
-  static bool lastFlameState = false;
-  bool currentFlame;
-  
-  // Override flame detection if pin is floating
-  if (reading >= 1020) {
-    currentFlame = false; // Ignore floating readings as flame detection
-    Serial.print("(IGNORING floating A0 reading) ");
+  // Determine potential flame state based on threshold
+  bool potentialFlame;
+  if (filteredReading >= 1020) {
+    potentialFlame = false; // Ignore floating readings
   } else {
-    if (lastFlameState) {
-      // If flame was detected, require lower threshold to turn off (hysteresis)
-      currentFlame = reading > (FLAME_DETECTION_THRESHOLD - FLAME_HYSTERESIS);
+    if (lastStableFlame) {
+      // Use hysteresis when turning off
+      potentialFlame = filteredReading > (FLAME_DETECTION_THRESHOLD - FLAME_HYSTERESIS);
     } else {
-      // If no flame, require higher threshold to detect flame
-      currentFlame = reading > (FLAME_DETECTION_THRESHOLD + FLAME_HYSTERESIS);
+      // Use hysteresis when turning on
+      potentialFlame = filteredReading > (FLAME_DETECTION_THRESHOLD + FLAME_HYSTERESIS);
     }
   }
   
-  lastFlameState = currentFlame;
+  // Require stability before changing state
+  bool isStable = (noiseLevel <= MAX_NOISE_TOLERANCE) && bufferFilled;
   
-  // Debug output every 2 seconds
-  static unsigned long lastDebugOutput = 0;
-  if (millis() - lastDebugOutput > 2000) {
-    Serial.print("Flame rod ADC: ");
-    Serial.print(reading);
-    if (reading >= 1020) {
-      Serial.print(" (FLOATING!)");
+  if (isStable && potentialFlame) {
+    stableFlameCount++;
+    stableNoFlameCount = 0;
+  } else if (isStable && !potentialFlame) {
+    stableNoFlameCount++;
+    stableFlameCount = 0;
+  } else {
+    // Readings are not stable, don't change counters
+    // This prevents state changes during noisy periods
+  }
+  
+  // Change state only after consecutive stable readings
+  bool newFlameState = lastStableFlame; // Default to current state
+  
+  if (stableFlameCount >= STABILITY_REQUIRED) {
+    newFlameState = true;
+    stableFlameCount = STABILITY_REQUIRED; // Prevent overflow
+  } else if (stableNoFlameCount >= STABILITY_REQUIRED) {
+    newFlameState = false;
+    stableNoFlameCount = STABILITY_REQUIRED; // Prevent overflow
+  }
+  
+  // Report state changes immediately
+  if (newFlameState != lastStableFlame) {
+    if (newFlameState) {
+      Serial.print("🔥 STABLE FLAME DETECTED! Filtered ADC: ");
+      Serial.print(filteredReading);
+      Serial.print(" (Raw: ");
+      Serial.print(rawReading);
+      Serial.print(", Noise: ");
+      Serial.print(noiseLevel);
+      Serial.print(", Threshold: ");
+      Serial.print(FLAME_DETECTION_THRESHOLD);
+      Serial.println(") 🔥");
+    } else {
+      Serial.print("❄️ STABLE FLAME LOST - Filtered ADC: ");
+      Serial.print(filteredReading);
+      Serial.print(" (Raw: ");
+      Serial.print(rawReading);
+      Serial.print(", Noise: ");
+      Serial.print(noiseLevel);
+      Serial.print(", Below threshold: ");
+      Serial.print(FLAME_DETECTION_THRESHOLD);
+      Serial.println(") ❄️");
     }
-    Serial.print(" (Threshold: ");
+    lastStableFlame = newFlameState;
+  }
+  
+  // Enhanced debug output every 3 seconds
+  static unsigned long lastDebugOutput = 0;
+  if (millis() - lastDebugOutput > 3000) {
+    Serial.print("Flame sensor - Raw: ");
+    Serial.print(rawReading);
+    Serial.print(" | Filtered: ");
+    Serial.print(filteredReading);
+    Serial.print(" | Noise: ");
+    Serial.print(noiseLevel);
+    Serial.print(" | Threshold: ");
     Serial.print(FLAME_DETECTION_THRESHOLD);
-    Serial.print("), Flame: ");
-    Serial.print(currentFlame ? "DETECTED" : "NONE");
-    if (reading >= 1020) {
-      Serial.print(" [IGNORED - FIX A0 WIRING]");
+    Serial.print(" | Flame: ");
+    Serial.print(newFlameState ? "🔥 YES" : "❄️ NO");
+    Serial.print(" | Stability: ");
+    Serial.print(isStable ? "STABLE" : "NOISY");
+    if (filteredReading >= 1020) {
+      Serial.print(" [FLOATING - FIX A0!]");
     }
     Serial.println();
     lastDebugOutput = millis();
   }
   
-  return currentFlame;
+  return newFlameState;
 }
 
 // --- Enhanced State Machine Logic (SINGLE RELAY VERSION) ---
 void updateBurnerStateMachine() {
   unsigned long currentTime = millis();
   
-  // Only update state machine once per second to reduce spam
+  // Faster state machine updates for better flame responsiveness
   static unsigned long lastStateMachineUpdate = 0;
-  if (currentTime - lastStateMachineUpdate < 1000) {
-    return; // Throttle state machine updates to once per second
+  if (currentTime - lastStateMachineUpdate < 250) {  // Changed from 1000ms to 250ms
+    return; // Update state machine every 250ms for faster flame response
   }
   lastStateMachineUpdate = currentTime;
   
-  // Read flame status only when needed
+  // Read flame status more frequently
   burner.flameDetected = readFlameStatus();
   
   switch (burner.state) {
@@ -276,7 +310,6 @@ void updateBurnerStateMachine() {
       // Safe state - all systems off (only set once per state change)
       static BurnerState lastState = FAULT; // Initialize to different state
       if (lastState != OFF) {
-        setFlameRodOutput(false);
         setPilotValve(false);
         setMainValve(false);
         Serial.println("System in OFF state - Type 'help' for commands");
@@ -286,10 +319,9 @@ void updateBurnerStateMachine() {
       
     case PILOT_IGNITING:
       lastState = PILOT_IGNITING;
-      // Phase 1: Open pilot valve and activate flame rod
+      // Phase 1: Open pilot valve (flame rod is passive receiver only)
       setPilotValve(true);
       setMainValve(false);
-      setFlameRodOutput(true);  // Activate flame rod for detection
       
       if (burner.flameDetected) {
         // Pilot flame established! (Testing mode - stay in pilot)
@@ -301,7 +333,6 @@ void updateBurnerStateMachine() {
       } 
       else if (currentTime - burner.stateStartTime > PILOT_IGNITION_TIME_MS) {
         // Ignition timeout
-        setFlameRodOutput(false);
         setPilotValve(false);
         
         if (burner.retryAttempt < MAX_IGNITION_ATTEMPTS) {
@@ -325,7 +356,6 @@ void updateBurnerStateMachine() {
       // Testing mode: Pilot running, main valve simulated
       setPilotValve(true);
       setMainValve(true);  // Simulated only
-      setFlameRodOutput(true);  // Keep flame rod active for monitoring
       
       if (!burner.flameDetected) {
         // Pilot flame lost!
@@ -339,7 +369,6 @@ void updateBurnerStateMachine() {
     case FLAMEOUT:
       lastState = FLAMEOUT;
       // Cooldown period before retry
-      setFlameRodOutput(false);
       setPilotValve(false);
       setMainValve(false);
       
@@ -359,7 +388,6 @@ void updateBurnerStateMachine() {
     case FAULT:
       lastState = FAULT;
       // System fault - requires manual reset
-      setFlameRodOutput(false);
       setPilotValve(false);
       setMainValve(false);
       
@@ -531,15 +559,11 @@ void handleSerialCommands() {
       Serial.println("status/st    - Show detailed status");
       Serial.println("test         - Basic flame sensor test");
       Serial.println("flame_test   - Detailed flame sensor analysis");
+      Serial.println("flame_test_live - Live flame monitoring with filtering");
+      Serial.println("noise_test   - Analyze signal noise for 30 seconds");
       Serial.println("flame_cal    - Calibrate flame sensor");
-      Serial.println("flame_on     - Turn flame rod output ON");
-      Serial.println("flame_off    - Turn flame rod output OFF");
-      Serial.println("flame_levels - Test all flame rod output levels");
-      Serial.println("flame_level <0-4> - Set specific flame rod level");
       Serial.println("flame_continuous - Continuous flame monitoring");
-      Serial.println("test_no_flame    - Test with no flame (rod OFF)");
-      Serial.println("test_small_flame - Test with small flame simulation");
-      Serial.println("test_full_flame  - Test with full flame simulation");
+      Serial.println("test_no_flame    - Test baseline with no flame");
       Serial.println("a0_test          - Enhanced A0 pin stability test (20 readings)");
       Serial.println("wiring_test      - Diagnose A0 pin wiring issues");
       Serial.println("glow_on      - Turn glow plug ON (pin 4)");
@@ -547,11 +571,12 @@ void handleSerialCommands() {
       Serial.println("glow_test    - Test glow plug control sequence");
       Serial.println("pin_test     - Test all GPIO pin outputs");
       Serial.println("help/h       - Show this help");
-      Serial.println("===================================");;
+      Serial.println("===================================");
     }
     else if (cmd == "test") {
       Serial.println("=== FLAME ROD TEST ===");
       Serial.println("Testing flame rod rectification circuit...");
+      Serial.println("NOTE: Flame rod is passive receiver - bring flame close to test");
       for (int i = 0; i < 10; i++) {
         int reading = analogRead(FLAME_SENSE_PIN);
         Serial.print("Reading ");
@@ -562,20 +587,21 @@ void handleSerialCommands() {
         Serial.print(FLAME_DETECTION_THRESHOLD);
         Serial.print(", Detected: ");
         Serial.print(reading > FLAME_DETECTION_THRESHOLD ? "YES" : "NO");
-        Serial.print(", Rod Output: ");
-        Serial.print(digitalRead(FLAME_ROD_OUT_PIN) ? "ACTIVE" : "OFF");
         Serial.println(")");
         delay(500);
       }
       Serial.println("========================");
     }
+    else if (cmd == "flame_test") {
+      testFlameRodDetailed();
+    }
     else if (cmd == "test_no_flame") {
-      Serial.println("=== NO FLAME TEST ===");
-      Serial.println("Testing sensor with flame rod OFF (no power)");
-      setFlameRodOutput(false);  // Turn OFF flame rod power
-      delay(1000);  // Let it stabilize
+      Serial.println("=== NO FLAME BASELINE TEST ===");
+      Serial.println("Testing sensor baseline with no flame present");
+      Serial.println("Make sure no flame or heat source is near the flame rod");
+      Serial.println();
       
-      Serial.println("Taking 10 readings with NO flame rod power...");
+      Serial.println("Taking 10 readings with NO flame present...");
       int total = 0;
       for (int i = 0; i < 10; i++) {
         int reading = analogRead(FLAME_SENSE_PIN);
@@ -588,7 +614,9 @@ void handleSerialCommands() {
         Serial.print(reading);
         Serial.print(", Detected=");
         Serial.print(detected ? "YES" : "NO");
-        Serial.print(", Rod Power=OFF");
+        if (reading >= 1020) {
+          Serial.print(" (FLOATING!)");
+        }
         Serial.println();
         delay(500);
       }
@@ -600,303 +628,1644 @@ void handleSerialCommands() {
       Serial.println();
       
       if (average < 30) {
-        Serial.println("GOOD: Low baseline - flame rod circuit working properly");
+        Serial.println("GOOD: Low baseline - flame sensor circuit working properly");
+      } else if (average >= 1020) {
+        Serial.println("PROBLEM: A0 pin floating - check wiring and 1MΩ resistor");
       } else {
-        Serial.println("WARNING: High baseline - check wiring or interference");
+        Serial.println("WARNING: High baseline - check for interference or heat sources");
       }
       Serial.println("======================");
     }
-    else if (cmd == "test_small_flame") {
-      Serial.println("=== SMALL FLAME TEST ===");
-      Serial.println("Testing sensor with LOW flame rod power (simulating small flame)");
-      
-      // Use PWM to simulate small flame detection
-      analogWrite(FLAME_ROD_OUT_PIN, 64);  // 25% power (low flame simulation)
-      delay(1000);  // Let it stabilize
-      
-      Serial.println("Taking 10 readings with LOW flame rod power...");
-      int total = 0;
-      for (int i = 0; i < 10; i++) {
-        int reading = analogRead(FLAME_SENSE_PIN);
-        total += reading;
-        bool detected = reading > FLAME_DETECTION_THRESHOLD;
-        
-        Serial.print("Reading ");
-        Serial.print(i + 1);
-        Serial.print(": ADC=");
-        Serial.print(reading);
-        Serial.print(", Detected=");
-        Serial.print(detected ? "YES" : "NO");
-        Serial.print(", Rod Power=LOW(25%)");
-        Serial.println();
-        delay(500);
-      }
-      
-      int average = total / 10;
-      Serial.print("RESULT: Average ADC = ");
-      Serial.print(average);
-      Serial.print(", Threshold = ");
-      Serial.print(FLAME_DETECTION_THRESHOLD);
+    else if (cmd == "flame_test_live") {
+      Serial.println("=== LIVE FLAME TEST WITH FILTERING ===");
+      Serial.println("Hold a lighter under the flame rod to test detection");
+      Serial.println("This will monitor flame detection with noise filtering");
+      Serial.println("Press any key to stop...");
       Serial.println();
       
-      if (average > FLAME_DETECTION_THRESHOLD) {
-        Serial.println("GOOD: Small flame detected - sensor responding to low power");
-      } else {
-        Serial.println("INFO: Small flame not detected - may need higher power or different threshold");
+      Serial.println("Flame rod is ready - bring lighter close to flame rod probe");
+      Serial.println("Format: Raw ADC | Filtered | Noise | Flame Status | Stability");
+      Serial.println("============================================================");
+      
+      bool lastFlameState = false;
+      int sampleCount = 0;
+      
+      // Reset filtering buffers for clean test
+      for (int i = 0; i < 20; i++) {
+        analogRead(FLAME_SENSE_PIN);
+        delay(10);
       }
       
-      setFlameRodOutput(false);  // Turn off after test
-      Serial.println("=========================");
+      while (!Serial.available()) {
+        // Take multiple rapid readings to show filtering effect
+        int rawTotal = 0;
+        int samples = 5;
+        for (int i = 0; i < samples; i++) {
+          rawTotal += analogRead(FLAME_SENSE_PIN);
+          delay(10);
+        }
+        int avgRaw = rawTotal / samples;
+        
+        bool currentFlame = readFlameStatus(); // This uses the filtered reading
+        int filteredReading = burner.lastFlameReading;
+        
+        sampleCount++;
+        
+        Serial.print("Sample ");
+        Serial.print(sampleCount);
+        Serial.print(": Raw=");
+        Serial.print(avgRaw);
+        Serial.print(" | Filt=");
+        Serial.print(filteredReading);
+        Serial.print(" | Noise=");
+        Serial.print(abs(avgRaw - filteredReading));
+        Serial.print(" | ");
+        Serial.print(currentFlame ? "🔥 FLAME" : "❄️ none ");
+        
+        // Show when flame status changes
+        if (currentFlame != lastFlameState) {
+          if (currentFlame) {
+            Serial.print(" | *** STABLE FLAME DETECTED! ***");
+          } else {
+            Serial.print(" | *** STABLE FLAME LOST ***");
+          }
+        }
+        Serial.println();
+        
+        lastFlameState = currentFlame;
+        delay(300); // ~3 samples per second
+      }
+      
+      // Clear the serial buffer
+      while (Serial.available()) Serial.read();
+      Serial.println("\nLive flame test stopped");
+      Serial.println("=============================");
     }
-    else if (cmd == "test_full_flame") {
-      Serial.println("=== FULL FLAME TEST ===");
-      Serial.println("Testing sensor with FULL flame rod power (simulating strong flame)");
-      setFlameRodOutput(true);  // Turn ON full flame rod power (3.3V)
-      delay(1000);  // Let it stabilize
-      
-      Serial.println("Taking 10 readings with FULL flame rod power...");
-      int total = 0;
-      for (int i = 0; i < 10; i++) {
-        int reading = analogRead(FLAME_SENSE_PIN);
-        total += reading;
-        bool detected = reading > FLAME_DETECTION_THRESHOLD;
-        
-        Serial.print("Reading ");
-        Serial.print(i + 1);
-        Serial.print(": ADC=");
-        Serial.print(reading);
-        Serial.print(", Detected=");
-        Serial.print(detected ? "YES" : "NO");
-        Serial.print(", Rod Power=FULL(3.3V)");
-        Serial.println();
-        delay(500);
-      }
-      
-      int average = total / 10;
-      Serial.print("RESULT: Average ADC = ");
-      Serial.print(average);
-      Serial.print(", Threshold = ");
-      Serial.print(FLAME_DETECTION_THRESHOLD);
+    else if (cmd == "noise_test") {
+      Serial.println("=== NOISE ANALYSIS TEST ===");
+      Serial.println("This will analyze signal noise and filtering effectiveness");
+      Serial.println("Testing for 30 seconds with current conditions...");
       Serial.println();
       
-      if (average > FLAME_DETECTION_THRESHOLD + 50) {
-        Serial.println("EXCELLENT: Strong flame signal - sensor working perfectly");
-      } else if (average > FLAME_DETECTION_THRESHOLD) {
-        Serial.println("GOOD: Flame detected - sensor working");
-      } else {
-        Serial.println("PROBLEM: No flame detected with full power - check circuit");
+      int totalSamples = 0;
+      int noisySamples = 0;
+      int maxNoise = 0;
+      int minReading = 1024;
+      int maxReading = 0;
+      
+      unsigned long startTime = millis();
+      while (millis() - startTime < 30000) { // 30 seconds
+        // Take rapid readings to measure noise
+        int readings[10];
+        for (int i = 0; i < 10; i++) {
+          readings[i] = analogRead(FLAME_SENSE_PIN);
+          delay(5);
+        }
+        
+        // Calculate noise for this sample
+        int minVal = 1024, maxVal = 0;
+        for (int i = 0; i < 10; i++) {
+          if (readings[i] < minVal) minVal = readings[i];
+          if (readings[i] > maxVal) maxVal = readings[i];
+          if (readings[i] < minReading) minReading = readings[i];
+          if (readings[i] > maxReading) maxReading = readings[i];
+        }
+        
+        int noise = maxVal - minVal;
+        if (noise > maxNoise) maxNoise = noise;
+        if (noise > MAX_NOISE_TOLERANCE) noisySamples++;
+        totalSamples++;
+        
+        if (totalSamples % 20 == 0) {
+          Serial.print("Sample ");
+          Serial.print(totalSamples);
+          Serial.print(": Noise=");
+          Serial.print(noise);
+          Serial.print(", Range=");
+          Serial.print(minVal);
+          Serial.print("-");
+          Serial.print(maxVal);
+          if (noise > MAX_NOISE_TOLERANCE) {
+            Serial.print(" (NOISY!)");
+          }
+          Serial.println();
+        }
+        
+        delay(200);
       }
       
-      setFlameRodOutput(false);  // Turn off after test
-      Serial.println("==========================");
+      Serial.println("\n=== NOISE ANALYSIS RESULTS ===");
+      Serial.print("Total samples: "); Serial.println(totalSamples);
+      Serial.print("Noisy samples: "); Serial.print(noisySamples); 
+      Serial.print(" ("); Serial.print((noisySamples * 100) / totalSamples); Serial.println("%)");
+      Serial.print("Max noise level: "); Serial.println(maxNoise);
+      Serial.print("Overall ADC range: "); Serial.print(minReading); 
+      Serial.print(" to "); Serial.println(maxReading);
+      Serial.print("Noise tolerance: "); Serial.println(MAX_NOISE_TOLERANCE);
+      
+      Serial.println("\n--- RECOMMENDATIONS ---");
+      if (noisySamples > totalSamples / 4) {
+        Serial.println("HIGH NOISE detected! Try:");
+        Serial.println("1. Add 100nF capacitor from A0 to GND (close to ESP8266)");
+        Serial.println("2. Use twisted pair or shielded cable for A0 connection");
+        Serial.println("3. Keep A0 wire away from power lines and switching circuits");
+        Serial.println("4. Check for loose connections in A0 circuit");
+        Serial.println("5. Consider increasing STABILITY_REQUIRED to 5");
+      } else if (noisySamples > totalSamples / 10) {
+        Serial.println("MODERATE NOISE - current filtering should handle this");
+      } else {
+        Serial.println("LOW NOISE - signal is clean, filtering working well");
+      }
+      Serial.println("================================");
     }
     else if (cmd == "a0_test") {
-      Serial.println("=== A0 PIN DIAGNOSTIC TEST ===");
-      Serial.println("This will take 20 readings over 2 seconds to diagnose A0 wiring issues");
-      Serial.println();
+      Serial.println("=== ENHANCED A0 PIN STABILITY TEST ===");
+      Serial.println("Testing A0 pin with 20 readings for stability analysis");
+      Serial.println("Format: Reading | ADC Value | Voltage | Status | Notes");
+      Serial.println("=======================================================");
       
-      int maxReading = 0;
-      int minReading = 1024;
-      int floatingCount = 0;
-      int normalCount = 0;
-      int totalReading = 0;
+      int readings[20];
+      int total = 0;
+      int minVal = 1024, maxVal = 0;
+      int stableCount = 0;
       
       for (int i = 0; i < 20; i++) {
-        int reading = analogRead(FLAME_SENSE_PIN);
-        totalReading += reading;
-        
-        if (reading > maxReading) maxReading = reading;
-        if (reading < minReading) minReading = reading;
-        
-        if (reading >= 1020) {
-          floatingCount++;
-          Serial.print("Reading ");
-          Serial.print(i+1);
-          Serial.print(": ");
-          Serial.print(reading);
-          Serial.println(" <- FLOATING/DISCONNECTED");
-        } else {
-          normalCount++;
-          Serial.print("Reading ");
-          Serial.print(i+1);
-          Serial.print(": ");
-          Serial.println(reading);
-        }
-        
-        delay(100);
-      }
-      
-      Serial.println();
-      Serial.println("=== A0 DIAGNOSTIC RESULTS ===");
-      Serial.print("Max reading: "); Serial.println(maxReading);
-      Serial.print("Min reading: "); Serial.println(minReading);
-      Serial.print("Average: "); Serial.println(totalReading / 20);
-      Serial.print("Floating readings: "); Serial.print(floatingCount); Serial.println("/20");
-      Serial.print("Normal readings: "); Serial.print(normalCount); Serial.println("/20");
-      
-      Serial.println();
-      if (floatingCount > 10) {
-        Serial.println("*** PROBLEM: A0 PIN IS FLOATING! ***");
-        Serial.println("DIAGNOSIS: A0 is not properly connected to ground through 1MΩ resistor");
-        Serial.println("SOLUTION:");
-        Serial.println("1. Connect 1MΩ resistor between A0 and GND pins on ESP8266");
-        Serial.println("2. Connect flame rod wire to A0 pin");
-        Serial.println("3. Verify GND connection is solid");
-        Serial.println("4. Check for loose wires or bad solder joints");
-      } else if (floatingCount > 0) {
-        Serial.println("*** WARNING: Intermittent A0 connection ***");
-        Serial.println("Some floating readings detected - check connections");
-      } else if (maxReading < 50 && minReading < 10) {
-        Serial.println("*** GOOD: A0 pin stable and grounded ***");
-        Serial.println("A0 wiring appears correct for flame detection");
-      } else {
-        Serial.println("*** INFO: A0 readings look normal ***");
-        Serial.println("Check flame rod positioning and output levels");
-      }
-      Serial.println();
-    }
-    else if (cmd == "wiring_test") {
-      Serial.println("=== A0 PIN WIRING DIAGNOSTIC ===");
-      Serial.println("This will help diagnose flame sensor wiring issues");
-      Serial.println("Your symptoms: ADC jumping between 0, 1024, and unstable readings");
-      Serial.println("This indicates A0 pin floating or poor connections");
-      
-      // Test A0 with everything OFF
-      setFlameRodOutput(false);
-      delay(500);
-      
-      Serial.println("\nStep 1: Multiple A0 readings with flame rod OFF...");
-      Serial.println("Taking 10 readings to check for instability:");
-      int readings[10];
-      int minVal = 1024, maxVal = 0;
-      
-      for (int i = 0; i < 10; i++) {
         readings[i] = analogRead(FLAME_SENSE_PIN);
-        if (readings[i] < minVal) minVal = readings[i];
-        if (readings[i] > maxVal) maxVal = readings[i];
-        Serial.print("  Reading ");
-        Serial.print(i + 1);
-        Serial.print(": ");
-        Serial.print(readings[i]);
-        if (readings[i] >= 1020) {
-          Serial.print(" (MAX - floating!)");
-        } else if (readings[i] <= 5) {
-          Serial.print(" (grounded)");
+        total += readings[i];
+        
+        if
+    </div>
+    <div class="burner-grid">
+      <div class="burner-card">
+        <h3>Burner 1</h3>
+        <div id="burner1Status" class="burner-status">Loading...</div>
+        <div id="burner1Flame">Flame: <span class="flame-indicator flame-no"></span></div>
+        <div id="burner1Retries">Retries: 0/3</div>
+        <div class="controls">
+          <button class="btn btn-primary" onclick="startIgnition()">IGNITE</button>
+          <button class="btn btn-danger" onclick="stopBurner()">STOP</button>
+          <button class="btn btn-secondary" onclick="resetBurner()">RESET</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    setInterval(updateStatus, 2000);
+    updateStatus();
+
+    async function updateStatus() {
+      try {
+        const response = await fetch('/status');
+        const burners = await response.json();
+        const burner = burners[0];
+        
+        const statusEl = document.getElementById('burner1Status');
+        const flameEl = document.getElementById('burner1Flame');
+        const retriesEl = document.getElementById('burner1Retries');
+        
+        let statusClass = '';
+        let statusText = '';
+        switch(burner.state) {
+          case 'off': statusClass = 'status-off'; statusText = 'OFF'; break;
+          case 'igniting': statusClass = 'status-igniting'; statusText = 'IGNITING PILOT...'; break;
+          case 'pilot-running': statusClass = 'status-on'; statusText = 'PILOT RUNNING (TEST)'; break;
+          case 'flameout': statusClass = 'status-fault'; statusText = 'FLAMEOUT'; break;
+          case 'fault': statusClass = 'status-fault'; statusText = 'FAULT - RESET REQUIRED'; break;
+          default: statusClass = 'status-off'; statusText = 'UNKNOWN'; break;
         }
-        Serial.println();
-        delay(200);
+        
+        statusEl.className = 'burner-status ' + statusClass;
+        statusEl.textContent = statusText;
+        
+        const flameIndicator = flameEl.querySelector('.flame-indicator');
+        flameIndicator.className = 'flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no');
+        flameEl.innerHTML = 'Flame: <span class="flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no') + '"></span> ' + (burner.flame ? 'DETECTED' : 'NONE') + ' (ADC: ' + (burner.flameSensorValue || 'N/A') + ')';
+        
+        retriesEl.textContent = 'Attempts: ' + burner.attempts + '/' + burner.maxAttempts;
+        
+        document.getElementById('systemStatus').textContent = 
+          'Burner 1: ' + statusText + ' | Flame: ' + (burner.flame ? 'Detected' : 'None') + ' | IP: ' + location.hostname;
+          
+      } catch (error) {
+        console.error('Status update failed:', error);
+        document.getElementById('systemStatus').textContent = 'Connection Error - Check firmware';
       }
-      
-      int range = maxVal - minVal;
-      Serial.print("\nRange: ");
-      Serial.print(minVal);
-      Serial.print(" to ");
-      Serial.print(maxVal);
-      Serial.print(" (span: ");
-      Serial.print(range);
-      Serial.println(")");
-      
-      if (range > 100) {
-        Serial.println("** PROBLEM: Highly unstable readings - A0 pin is FLOATING **");
-        Serial.println("   CRITICAL: A0 pin not properly connected!");
-        Serial.println("   FIXES:");
-        Serial.println("   1. Check A0 wire is firmly inserted into breadboard/connector");
-        Serial.println("   2. Add 1MΩ resistor from A0 to GND if missing");
-        Serial.println("   3. Check for loose connections at A0 pin");
-        Serial.println("   4. Verify continuity from A0 pin to your circuit");
-      } else if (maxVal >= 1020) {
-        Serial.println("** PROBLEM: A0 reading maximum (3.3V) **");
-        Serial.println("   Possible causes:");
-        Serial.println("   * A0 not connected to circuit (floating)");
-        Serial.println("   * A0 shorted to 3.3V rail");
-        Serial.println("   * Missing pull-down resistor (1MΩ to GND)");
-      } else if (maxVal <= 10) {
-        Serial.println("** GOOD: A0 properly grounded via resistor **");
+    }
+
+    async function sendCommand(cmd) {
+      try {
+        const response = await fetch('/control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'cmd=' + cmd
+        });
+        const result = await response.text();
+        console.log('Command result:', result);
+        document.getElementById('systemStatus').textContent = result;
+        setTimeout(updateStatus, 500);
+      } catch (error) {
+        console.error('Command failed:', error);
+        alert('Command failed - check ESP8266 connection');
       }
+    }
+
+    function startIgnition() { 
+      if (confirm('Start ignition sequence?')) {
+        sendCommand('ignite'); 
+      }
+    }
+    function stopBurner() { 
+      if (confirm('Emergency shutdown?')) {
+        sendCommand('stop'); 
+      }
+    }
+    function resetBurner() { 
+      if (confirm('Reset system from FAULT state?')) {
+        sendCommand('reset'); 
+      }
+    }
+    function emergencyStop() { 
+      if (confirm('EMERGENCY STOP will immediately shut off all systems!')) {
+        sendCommand('stop'); 
+      }
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+String getWebUI() {
+  return FPSTR(webUI);
+}
+
+// --- Setup Function ---
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  Serial.println("\n=== FlameWerks Remote Burner Control System ===");
+  Serial.println("ESP8266 Thing Dev - Auburn I-31-2 Compatible");
+  
+  // Initialize GPIO pins
+  pinMode(PILOT_RELAY_PIN, OUTPUT);
+  pinMode(MAIN_RELAY_PIN, OUTPUT);  // Pin 4 - Now enabled for glow plug control
+  
+  // Ensure all outputs start OFF
+  setPilotValve(false);
+  setMainValve(false);
+  setGlowPlug(false);  // Initialize glow plug to OFF
+  
+  // Initialize burner controller
+  burner.state = OFF;
+  burner.stateStartTime = millis();
+  burner.retryAttempt = 0;
+  burner.flameDetected = false;
+  burner.igniterActive = false;
+  burner.pilotValveOpen = false;
+  burner.mainValveOpen = false;
+  
+  Serial.println("Hardware initialized - Single relay testing mode");
+  Serial.println("WARNING: PILOT VALVE ONLY - Main valve simulated");
+  Serial.println("   Connect 2nd relay to GPIO4 for full operation");
+  Serial.println("   Flame rod is PASSIVE RECEIVER ONLY");
+  
+  // Connect to WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(hostname);
+  WiFi.begin(ssid, password);
+  
+  Serial.print("Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected successfully!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Hostname: ");
+    Serial.println(hostname);
+    
+    // Start mDNS responder
+    if (MDNS.begin(hostname)) {
+      Serial.println("mDNS responder started");
+      Serial.print("Access via: http://");
+      Serial.print(hostname);
+      Serial.println(".local/");
+    }
+  } else {
+    Serial.println("\nWiFi connection failed!");
+    Serial.println("System will continue in offline mode");
+  }
+  
+  // Configure web server routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/control", HTTP_POST, handleControl);
+  server.onNotFound(handleNotFound);
+  
+  // Start web server
+  server.begin();
+  Serial.println("Web server started on port 80");
+  
+  Serial.println("\n=== System Ready ===");
+  Serial.println("Commands: i=ignite, e=stop, r=reset, s=status, help");
+  Serial.println("Web UI: http://" + WiFi.localIP().toString() + "/");
+  Serial.println("========================\n");
+}
+
+// --- Main Loop ---
+void loop() {
+  // Handle web server requests
+  server.handleClient();
+  
+  // Handle mDNS
+  MDNS.update();
+  
+  // Handle serial commands
+  handleSerialCommands();
+  
+  // Update burner state machine
+  updateBurnerStateMachine();
+  
+  // Small delay to prevent excessive CPU usage
+  delay(50);
+}
+
+// --- Flame Rod Testing Functions ---
+void testFlameRodDetailed() {
+  Serial.println("\n=== DETAILED FLAME ROD TEST ===");
+  Serial.println("Testing flame rectification circuit...");
+  Serial.println("Format: Sample | ADC | Status | Output");
+  Serial.println("=====================================");
+  
+  int total = 0;
+  int minVal = 1024;
+  int maxVal = 0;
+  int flameCount = 0;
+  
+  for (int i = 0; i < 20; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    bool detected = reading > FLAME_DETECTION_THRESHOLD;
+    bool rodActive = digitalRead(FLAME_ROD_OUT_PIN);
+    
+    total += reading;
+    if (reading < minVal) minVal = reading;
+    if (reading > maxVal) maxVal = reading;
+    if (detected) flameCount++;
+    
+    Serial.print("  ");
+    Serial.print(i + 1);
+    Serial.print("   | ");
+    Serial.print(reading);
+    if (reading < 100) Serial.print(" ");
+    if (reading < 10) Serial.print(" ");
+    Serial.print(" | ");
+    Serial.print(detected ? "FLAME" : "none ");
+    Serial.print(" | ");
+    Serial.println(rodActive ? "3.3V" : "0V");
+    
+    delay(500);
+  }
+  
+  int average = total / 20;
+  
+  Serial.println("\n--- FLAME ROD ANALYSIS ---");
+  Serial.print("Average: ");
+  Serial.print(average);
+  Serial.print(" | Range: ");
+  Serial.print(minVal);
+  Serial.print("-");
+  Serial.print(maxVal);
+  Serial.print(" | Span: ");
+  Serial.println(maxVal - minVal);
+  Serial.print("Threshold: ");
+  Serial.print(FLAME_DETECTION_THRESHOLD);
+  Serial.print(" | Detection rate: ");
+  Serial.print(flameCount);
+  Serial.print("/20 (");
+  Serial.print((flameCount * 100) / 20);
+  Serial.println("%)");
+  
+  Serial.println("\n--- CIRCUIT ASSESSMENT ---");
+  if (maxVal - minVal < 30) {
+    Serial.println("WARNING: Very low variation - check flame rod wiring");
+    Serial.println("   - Verify 1MΩ resistor connection");
+    Serial.println("   - Check flame rod probe contact");
+  } else if (maxVal - minVal > 100) {
+    Serial.println("GOOD: Good signal variation - flame rod working");
+  } else {
+    Serial.println("INFO: Moderate variation - acceptable operation");
+  }
+  
+  if (average < 30) {
+    Serial.println("INFO: Low baseline - good for flame detection");
+  } else if (average > 100) {
+    Serial.println("WARNING: High baseline - may need threshold adjustment");
+  }
+  
+  Serial.println("===============================");
+}
+
+void calibrateFlameRod() {
+  Serial.println("\n=== FLAME ROD CALIBRATION ===");
+  Serial.println("This will determine optimal flame detection threshold");
+  Serial.println("NOTE: Flame rod is passive receiver only");
+  
+  // Step 1: No flame reading
+  Serial.println("\nSTEP 1: NO FLAME BASELINE");
+  Serial.println("Ensure no flame or heat source is near the flame rod...");
+  delay(2000);
+  
+  Serial.println("Taking baseline readings (no flame)...");
+  int noFlameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    noFlameTotal += reading;
+    Serial.print("No flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int noFlameAverage = noFlameTotal / 10;
+  
+  Serial.print("GOOD: No flame average: ");
+  Serial.println(noFlameAverage);
+  
+  // Step 2: With flame reading
+  Serial.println("\nSTEP 2: FLAME DETECTION");
+  Serial.println("Light flame near flame rod probe...");
+  Serial.println("Press any key when flame is stable...");
+  
+  while (!Serial.available()) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    Serial.print("Current reading: ");
+    Serial.print(reading);
+    Serial.print(" (bring flame closer to rod)");
+    delay(1000);
+  }
+  while (Serial.available()) Serial.read(); // Clear buffer
+  
+  Serial.println("Taking flame readings...");
+  int flameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    flameTotal += reading;
+    Serial.print("With flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int flameAverage = flameTotal / 10;
+  
+  Serial.print("GOOD: Flame average: ");
+  Serial.println(flameAverage);
+  
+  // Calculate results
+  int difference = flameAverage - noFlameAverage;
+  int recommendedThreshold = noFlameAverage + (difference / 3); // 33% above baseline
+  
+  Serial.println("\n--- CALIBRATION RESULTS ---");
+  Serial.print("No flame: ");
+  Serial.print(noFlameAverage);
+  Serial.print(" | With flame: ");
+  Serial.println(flameAverage);
+  Serial.print("Difference: ");
+  Serial.print(difference);
+  Serial.print(" | Ratio: ");
+  if (noFlameAverage > 0) {
+    Serial.print((float)flameAverage / noFlameAverage, 1);
+    Serial.println(":1");
+  } else {
+    Serial.println("N/A");
+  }
+  
+  Serial.print("Current threshold: ");
+  Serial.println(FLAME_DETECTION_THRESHOLD);
+  Serial.print("Recommended threshold: ");
+  Serial.println(recommendedThreshold);
+  
+  if (difference < 20) {
+    Serial.println("\nPOOR: Very small flame signal");
+    Serial.println("   Check: Flame rod position, 1MΩ resistor, connections");
+    Serial.println("   Try holding flame closer to the rod probe");
+  } else if (difference < 50) {
+    Serial.println("\nWARNING: MARGINAL: Weak flame signal");
+    Serial.println("   Consider: Better flame rod positioning closer to flame");
+  } else {
+    Serial.println("\nGOOD: Strong flame rectification signal");
+  }
+  
+  Serial.println("\n--- UPDATE FIRMWARE ---");
+  Serial.println("To use new threshold, change this line:");
+  Serial.print("const int FLAME_DETECTION_THRESHOLD = ");
+  Serial.print(recommendedThreshold);
+  Serial.println(";");
+  Serial.println("============================");
+}
+
+// --- Flame Rod Level Testing Function ---
+void testFlameRodLevels() {
+  Serial.println("\n=== FLAME ROD OUTPUT LEVEL TEST ===");
+  Serial.println("Testing different flame rod output levels...");
+  Serial.println("This simulates different flame intensities for sensor calibration");
+  Serial.println("Format: Level | Output | ADC Reading | Detected | Notes");
+  Serial.println("========================================================");
+  
+  // Test each level for 3 seconds with readings
+  int levels[] = {0, 1, 2, 3, 4};
+  String levelNames[] = {"OFF", "LOW", "MEDIUM", "HIGH", "FULL"};
+  String voltages[] = {"0V", "~0.8V", "~1.6V", "~2.5V", "3.3V"};
+  
+  for (int i = 0; i < 5; i++) {
+    Serial.print("\n--- Testing Level ");
+    Serial.print(levels[i]);
+    Serial.print(" (");
+    Serial.print(levelNames[i]);
+    Serial.print(" - ");
+    Serial.print(voltages[i]);
+    Serial.println(") ---");
+    
+    setFlameRodOutputLevel(levels[i]);
+    delay(500); // Let output stabilize
+    
+    // Take 5 readings over 2.5 seconds
+    int total = 0;
+    int maxReading = 0;
+    int minReading = 1024;
+    int detectedCount = 0;
+    
+    for (int j = 0; j < 5; j++) {
+      int reading = analogRead(FLAME_SENSE_PIN);
+      bool detected = reading > FLAME_DETECTION_THRESHOLD;
       
-      Serial.println("\nStep 2: Testing with flame rod ON...");
-      setFlameRodOutput(true);
-      delay(1000);
+      total += reading;
+      if (reading > maxReading) maxReading = reading;
+      if (reading < minReading) minReading = reading;
+      if (detected) detectedCount++;
       
-      Serial.println("Taking 5 readings with flame rod power ON:");
-      for (int i = 0; i < 5; i++) {
-        int reading = analogRead(FLAME_SENSE_PIN);
-        Serial.print("  With power ");
-        Serial.print(i + 1);
-        Serial.print(": ");
-        Serial.print(reading);
-        if (reading >= 1020) {
-          Serial.print(" (still floating!)");
+      Serial.print("  Reading ");
+      Serial.print(j + 1);
+      Serial.print(": ");
+      Serial.print(reading);
+      Serial.print(" | ");
+      Serial.print(detected ? "FLAME" : "none ");
+      
+      if (j == 0) {
+        // Add interpretation for first reading
+        if (levels[i] == 0 && reading < 20) {
+          Serial.print(" | GOOD: Good baseline");
+        } else if (levels[i] > 0 && reading > FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | GOOD: Good flame signal");
+        } else if (levels[i] > 0 && reading <= FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | WARNING: Weak signal");
         }
-        Serial.println();
-        delay(200);
       }
+      Serial.println();
       
-      setFlameRodOutput(false);
+      delay(500);
+    }
+    
+    int average = total / 5;
+    Serial.print("  Summary - Avg: ");
+    Serial.print(average);
+    Serial.print(" | Range: ");
+    Serial.print(minReading);
+    Serial.print("-");
+    Serial.print(maxReading);
+    Serial.print(" | Detection: ");
+    Serial.print(detectedCount);
+    Serial.println("/5");
+    
+    // Analysis
+    if (levels[i] == 0) {
+      if (average < 30) {
+        Serial.println("  GOOD: Good baseline - low noise");
+      } else {
+        Serial.println("  WARNING: High baseline - check wiring");
+      }
+    } else {
+      int signalIncrease = average - 20; // Assume ~20 baseline
+      if (signalIncrease > 50) {
+        Serial.println("  GOOD: Strong signal increase");
+      } else if (signalIncrease > 20) {
+        Serial.println("  INFO: Moderate signal increase");
+      } else {
+        Serial.println("  PROBLEM: Weak signal - check circuit");
+      }
+    }
+  }
+  
+  Serial.println("\n=== TEST COMPLETE ===");
+  Serial.println("Analysis:");
+  Serial.println("- Level 0 should show low baseline readings");
+  Serial.println("- Higher levels should show increasing ADC values");
+  Serial.println("- Flame detection should trigger at higher levels");
+  Serial.println("- If all levels show similar readings, check:");
+  Serial.println("  * 1MΩ resistor connection");
+  Serial.println("  * A0 pin wiring");
+  Serial.println("  * GPIO5 output circuit");
+  
+  // Return to OFF state
+  setFlameRodOutputLevel(0);
+  Serial.println("\nFlame rod output returned to OFF");
+  Serial.println("=============================");
+}
+  int noFlameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    noFlameTotal += reading;
+    Serial.print("No flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int noFlameAverage = noFlameTotal / 10;
+  
+  Serial.print("GOOD: No flame average: ");
+  Serial.println(noFlameAverage);
+  
+  // Step 2: With flame reading
+  Serial.println("\nSTEP 2: FLAME DETECTION");
+  Serial.println("Light flame near flame rod probe...");
+  Serial.println("Press any key when flame is stable...");
+  
+  while (!Serial.available()) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    Serial.print("Current reading: ");
+    Serial.print(reading);
+    Serial.print(" (Rod: ");
+    Serial.print(digitalRead(FLAME_ROD_OUT_PIN) ? "ON" : "OFF");
+    Serial.println(")");
+    delay(1000);
+  }
+  while (Serial.available()) Serial.read(); // Clear buffer
+  
+  Serial.println("Taking flame readings...");
+  int flameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    flameTotal += reading;
+    Serial.print("With flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int flameAverage = flameTotal / 10;
+  
+  Serial.print("GOOD: Flame average: ");
+  Serial.println(flameAverage);
+  
+  // Calculate results
+  int difference = flameAverage - noFlameAverage;
+  int recommendedThreshold = noFlameAverage + (difference / 3); // 33% above baseline
+  
+  Serial.println("\n--- CALIBRATION RESULTS ---");
+  Serial.print("No flame: ");
+  Serial.print(noFlameAverage);
+  Serial.print(" | With flame: ");
+  Serial.println(flameAverage);
+  Serial.print("Difference: ");
+  Serial.print(difference);
+  Serial.print(" | Ratio: ");
+  if (noFlameAverage > 0) {
+    Serial.print((float)flameAverage / noFlameAverage, 1);
+    Serial.println(":1");
+  } else {
+    Serial.println("N/A");
+  }
+  
+  Serial.print("Current threshold: ");
+  Serial.println(FLAME_DETECTION_THRESHOLD);
+  Serial.print("Recommended threshold: ");
+  Serial.println(recommendedThreshold);
+  
+  if (difference < 20) {
+    Serial.println("\nPOOR: Very small flame signal");
+    Serial.println("   Check: Flame rod in flame path, 1MΩ resistor, connections");
+  } else if (difference < 50) {
+    Serial.println("\nWARNING: MARGINAL: Weak flame signal");
+    Serial.println("   Consider: Better flame rod position, AC voltage source");
+  } else {
+    Serial.println("\nGOOD: Strong flame rectification signal");
+  }
+  
+  Serial.println("\n--- UPDATE FIRMWARE ---");
+  Serial.println("To use new threshold, change this line:");
+  Serial.print("const int FLAME_DETECTION_THRESHOLD = ");
+  Serial.print(recommendedThreshold);
+  Serial.println(";");
+  Serial.println("============================");
+  
+  setFlameRodOutput(false); // Turn off flame rod after calibration
+}
+
+// --- Flame Rod Level Testing Function ---
+void testFlameRodLevels() {
+  Serial.println("\n=== FLAME ROD OUTPUT LEVEL TEST ===");
+  Serial.println("Testing different flame rod output levels...");
+  Serial.println("This simulates different flame intensities for sensor calibration");
+  Serial.println("Format: Level | Output | ADC Reading | Detected | Notes");
+  Serial.println("========================================================");
+  
+  // Test each level for 3 seconds with readings
+  int levels[] = {0, 1, 2, 3, 4};
+  String levelNames[] = {"OFF", "LOW", "MEDIUM", "HIGH", "FULL"};
+  String voltages[] = {"0V", "~0.8V", "~1.6V", "~2.5V", "3.3V"};
+  
+  for (int i = 0; i < 5; i++) {
+    Serial.print("\n--- Testing Level ");
+    Serial.print(levels[i]);
+    Serial.print(" (");
+    Serial.print(levelNames[i]);
+    Serial.print(" - ");
+    Serial.print(voltages[i]);
+    Serial.println(") ---");
+    
+    setFlameRodOutputLevel(levels[i]);
+    delay(500); // Let output stabilize
+    
+    // Take 5 readings over 2.5 seconds
+    int total = 0;
+    int maxReading = 0;
+    int minReading = 1024;
+    int detectedCount = 0;
+    
+    for (int j = 0; j < 5; j++) {
+      int reading = analogRead(FLAME_SENSE_PIN);
+      bool detected = reading > FLAME_DETECTION_THRESHOLD;
       
-      Serial.println("\n=== HARDWARE DIAGNOSIS ===");
-      Serial.println("Based on your unstable 0/1024 readings:");
+      total += reading;
+      if (reading > maxReading) maxReading = reading;
+      if (reading < minReading) minReading = reading;
+      if (detected) detectedCount++;
+      
+      Serial.print("  Reading ");
+      Serial.print(j + 1);
+      Serial.print(": ");
+      Serial.print(reading);
+      Serial.print(" | ");
+      Serial.print(detected ? "FLAME" : "none ");
+      
+      if (j == 0) {
+        // Add interpretation for first reading
+        if (levels[i] == 0 && reading < 20) {
+          Serial.print(" | GOOD: Good baseline");
+        } else if (levels[i] > 0 && reading > FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | GOOD: Good flame signal");
+        } else if (levels[i] > 0 && reading <= FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | WARNING: Weak signal");
+        }
+      }
       Serial.println();
-      Serial.println("MOST LIKELY PROBLEM: A0 pin is FLOATING (not connected)");
+      
+      delay(500);
+    }
+    
+    int average = total / 5;
+    Serial.print("  Summary - Avg: ");
+    Serial.print(average);
+    Serial.print(" | Range: ");
+    Serial.print(minReading);
+    Serial.print("-");
+    Serial.print(maxReading);
+    Serial.print(" | Detection: ");
+    Serial.print(detectedCount);
+    Serial.println("/5");
+    
+    // Analysis
+    if (levels[i] == 0) {
+      if (average < 30) {
+        Serial.println("  GOOD: Good baseline - low noise");
+      } else {
+        Serial.println("  WARNING: High baseline - check wiring");
+      }
+    } else {
+      int signalIncrease = average - 20; // Assume ~20 baseline
+      if (signalIncrease > 50) {
+        Serial.println("  GOOD: Strong signal increase");
+      } else if (signalIncrease > 20) {
+        Serial.println("  INFO: Moderate signal increase");
+      } else {
+        Serial.println("  PROBLEM: Weak signal - check circuit");
+      }
+    }
+  }
+  
+  Serial.println("\n=== TEST COMPLETE ===");
+  Serial.println("Analysis:");
+  Serial.println("- Level 0 should show low baseline readings");
+  Serial.println("- Higher levels should show increasing ADC values");
+  Serial.println("- Flame detection should trigger at higher levels");
+  Serial.println("- If all levels show similar readings, check:");
+  Serial.println("  * 1MΩ resistor connection");
+  Serial.println("  * A0 pin wiring");
+  Serial.println("  * GPIO5 output circuit");
+  
+  // Return to OFF state
+  setFlameRodOutputLevel(0);
+  Serial.println("\nFlame rod output returned to OFF");
+  Serial.println("=============================");
+}
+  Serial.println("Taking baseline readings (no flame)...");
+  int noFlameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    noFlameTotal += reading;
+    Serial.print("No flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int noFlameAverage = noFlameTotal / 10;
+  
+  Serial.print("GOOD: No flame average: ");
+  Serial.println(noFlameAverage);
+  
+  // Step 2: With flame reading
+  Serial.println("\nSTEP 2: FLAME DETECTION");
+  Serial.println("Light flame near flame rod probe...");
+  Serial.println("Press any key when flame is stable...");
+  
+  while (!Serial.available()) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    Serial.print("Current reading: ");
+    Serial.print(reading);
+    Serial.print(" (Rod: ");
+    Serial.print(digitalRead(FLAME_ROD_OUT_PIN) ? "ON" : "OFF");
+    Serial.println(")");
+    delay(1000);
+  }
+  while (Serial.available()) Serial.read(); // Clear buffer
+  
+  Serial.println("Taking flame readings...");
+  int flameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    flameTotal += reading;
+    Serial.print("With flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int flameAverage = flameTotal / 10;
+  
+  Serial.print("GOOD: Flame average: ");
+  Serial.println(flameAverage);
+  
+  // Calculate results
+  int difference = flameAverage - noFlameAverage;
+  int recommendedThreshold = noFlameAverage + (difference / 3); // 33% above baseline
+  
+  Serial.println("\n--- CALIBRATION RESULTS ---");
+  Serial.print("No flame: ");
+  Serial.print(noFlameAverage);
+  Serial.print(" | With flame: ");
+  Serial.println(flameAverage);
+  Serial.print("Difference: ");
+  Serial.print(difference);
+  Serial.print(" | Ratio: ");
+  if (noFlameAverage > 0) {
+    Serial.print((float)flameAverage / noFlameAverage, 1);
+    Serial.println(":1");
+  } else {
+    Serial.println("N/A");
+  }
+  
+  Serial.print("Current threshold: ");
+  Serial.println(FLAME_DETECTION_THRESHOLD);
+  Serial.print("Recommended threshold: ");
+  Serial.println(recommendedThreshold);
+  
+  if (difference < 20) {
+    Serial.println("\nPOOR: Very small flame signal");
+    Serial.println("   Check: Flame rod in flame path, 1MΩ resistor, connections");
+  } else if (difference < 50) {
+    Serial.println("\nWARNING: MARGINAL: Weak flame signal");
+    Serial.println("   Consider: Better flame rod position, AC voltage source");
+  } else {
+    Serial.println("\nGOOD: Strong flame rectification signal");
+  }
+  
+  Serial.println("\n--- UPDATE FIRMWARE ---");
+  Serial.println("To use new threshold, change this line:");
+  Serial.print("const int FLAME_DETECTION_THRESHOLD = ");
+  Serial.print(recommendedThreshold);
+  Serial.println(";");
+  Serial.println("============================");
+  
+  setFlameRodOutput(false); // Turn off flame rod after calibration
+}
+
+// --- Flame Rod Level Testing Function ---
+void testFlameRodLevels() {
+  Serial.println("\n=== FLAME ROD OUTPUT LEVEL TEST ===");
+  Serial.println("Testing different flame rod output levels...");
+  Serial.println("This simulates different flame intensities for sensor calibration");
+  Serial.println("Format: Level | Output | ADC Reading | Detected | Notes");
+  Serial.println("========================================================");
+  
+  // Test each level for 3 seconds with readings
+  int levels[] = {0, 1, 2, 3, 4};
+  String levelNames[] = {"OFF", "LOW", "MEDIUM", "HIGH", "FULL"};
+  String voltages[] = {"0V", "~0.8V", "~1.6V", "~2.5V", "3.3V"};
+  
+  for (int i = 0; i < 5; i++) {
+    Serial.print("\n--- Testing Level ");
+    Serial.print(levels[i]);
+    Serial.print(" (");
+    Serial.print(levelNames[i]);
+    Serial.print(" - ");
+    Serial.print(voltages[i]);
+    Serial.println(") ---");
+    
+    setFlameRodOutputLevel(levels[i]);
+    delay(500); // Let output stabilize
+    
+    // Take 5 readings over 2.5 seconds
+    int total = 0;
+    int maxReading = 0;
+    int minReading = 1024;
+    int detectedCount = 0;
+    
+    for (int j = 0; j < 5; j++) {
+      int reading = analogRead(FLAME_SENSE_PIN);
+      bool detected = reading > FLAME_DETECTION_THRESHOLD;
+      
+      total += reading;
+      if (reading > maxReading) maxReading = reading;
+      if (reading < minReading) minReading = reading;
+      if (detected) detectedCount++;
+      
+      Serial.print("  Reading ");
+      Serial.print(j + 1);
+      Serial.print(": ");
+      Serial.print(reading);
+      Serial.print(" | ");
+      Serial.print(detected ? "FLAME" : "none ");
+      
+      if (j == 0) {
+        // Add interpretation for first reading
+        if (levels[i] == 0 && reading < 20) {
+          Serial.print(" | GOOD: Good baseline");
+        } else if (levels[i] > 0 && reading > FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | GOOD: Good flame signal");
+        } else if (levels[i] > 0 && reading <= FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | WARNING: Weak signal");
+        }
+      }
       Serial.println();
-      Serial.println("IMMEDIATE FIXES TO TRY:");
-      Serial.println("1. **CHECK A0 CONNECTION**");
-      Serial.println("   - Verify wire is firmly connected to A0 pin");
-      Serial.println("   - Use multimeter to test continuity from A0 pin to your circuit");
-      Serial.println();
-      Serial.println("2. **ADD PULL-DOWN RESISTOR**");
-      Serial.println("   - Connect 1MΩ resistor from A0 to GND");
-      Serial.println("   - This prevents floating and provides stable baseline");
-      Serial.println();
-      Serial.println("3. **VERIFY FLAME ROD CIRCUIT**");
-      Serial.println("   - GPIO5 (D1) -> Flame Rod Probe");
-      Serial.println("   - Flame Rod Probe -> A0 + 1MΩ resistor");
-      Serial.println("   - 1MΩ resistor -> GND");
-      Serial.println();
-      Serial.println("Expected behavior after fixing:");
-      Serial.println("- A0 should read 0-30 when flame rod OFF");
-      Serial.println("- A0 should read 50-200+ when flame rod ON");
-      Serial.println("- Readings should be stable, not jumping wildly");
+      
+      delay(500);
+    }
+    
+    int average = total / 5;
+    Serial.print("  Summary - Avg: ");
+    Serial.print(average);
+    Serial.print(" | Range: ");
+    Serial.print(minReading);
+    Serial.print("-");
+    Serial.print(maxReading);
+    Serial.print(" | Detection: ");
+    Serial.print(detectedCount);
+    Serial.println("/5");
+    
+    // Analysis
+    if (levels[i] == 0) {
+      if (average < 30) {
+        Serial.println("  GOOD: Good baseline - low noise");
+      } else {
+        Serial.println("  WARNING: High baseline - check wiring");
+      }
+    } else {
+      int signalIncrease = average - 20; // Assume ~20 baseline
+      if (signalIncrease > 50) {
+        Serial.println("  GOOD: Strong signal increase");
+      } else if (signalIncrease > 20) {
+        Serial.println("  INFO: Moderate signal increase");
+      } else {
+        Serial.println("  PROBLEM: Weak signal - check circuit");
+      }
+    }
+  }
+  
+  Serial.println("\n=== TEST COMPLETE ===");
+  Serial.println("Analysis:");
+  Serial.println("- Level 0 should show low baseline readings");
+  Serial.println("- Higher levels should show increasing ADC values");
+  Serial.println("- Flame detection should trigger at higher levels");
+  Serial.println("- If all levels show similar readings, check:");
+  Serial.println("  * 1MΩ resistor connection");
+  Serial.println("  * A0 pin wiring");
+  Serial.println("  * GPIO5 output circuit");
+  
+  // Return to OFF state
+  setFlameRodOutputLevel(0);
+  Serial.println("\nFlame rod output returned to OFF");
+  Serial.println("=============================");
+}
+
+ * FlameWerks Remote Burner Control System - SINGLE RELAY TEST VERSION
+ * ESP8266 Thing Dev Board - Auburn I-31-2 Igniter Compatible
+ * 
+ * WARNING: TESTING CONFIGURATION - SINGLE RELAY ONLY
+ * This version uses only 1 relay for PILOT VALVE control
+ * Main valve functionality is DISABLED for testing
+ * 
+ * Current Hardware Configuration (TESTING):
+ * GPIO 2  -> Pilot Valve Relay (via PC817 optocoupler) [ACTIVE]
+ * GPIO 4  -> Beefcake Relay -> 12V Glow Plug Control [ACTIVE]
+ * GPIO 5  -> Flame Rod Output (AC voltage to flame rod probe) [ACTIVE]
+ * A0      -> Flame Rod Input (via 1MΩ resistor - flame rectification) [ACTIVE]
+ * 
+ *  STANDARD PRODUCTION CONFIGURATION (when you get 2nd relay):
+ *  GPIO 2  -> Pilot Valve Relay (via PC817 optocoupler)
+ *  GPIO 4  -> Main Valve Relay (via PC817 optocoupler) 
+ *  GPIO 5  -> Igniter Control (Auburn I-31-2)
+ *  A0      -> Flame Sensor (Auburn I-31-2 + 1MΩ resistor)
+ *  
+ *  Standard Operation:
+ *  1. PILOT_IGNITING: Open pilot valve + igniter spark
+ *  2. PILOT_ESTABLISHED: Pilot flame detected, stabilize 2 seconds
+ *  3. MAIN_ON: Open main valve for full operation
+ *  
+ *  Testing Operation (Current):
+ *  1. PILOT_IGNITING: Open pilot valve + igniter spark
+ *  2. PILOT_ON: Pilot flame detected, stay in pilot mode
+ *  3. Main valve commands are logged but not executed
+ 
+ * 
+ * Safety Features:
+ * - 5-second ignition timeout with automatic shutoff
+ * - Flame loss detection with immediate emergency closure
+ * - 3-attempt retry logic with 3-second cooldown
+ * - Fault state requiring manual reset
+ * - Electrical isolation via PC817 optocouplers
+ */
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <WiFiClient.h>
+
+// --- Pin Definitions (ESP8266 Thing Dev Board) ---
+#define PILOT_RELAY_PIN  2    // GPIO2 -> PC817 -> Pilot Valve Relay [ACTIVE]
+#define MAIN_RELAY_PIN   4    // GPIO4 -> Relay/MOSFET -> 12V Glow Plug Control [ACTIVE]
+#define FLAME_ROD_OUT_PIN 5   // GPIO5 -> Flame Rod AC Output [ACTIVE]
+#define IGNITER_PIN      5    // GPIO5 -> Igniter/Flame Rod Output [ACTIVE] (alias)
+#define FLAME_SENSE_PIN  A0   // A0 -> Flame Rod Input via 1MΩ (rectification) [ACTIVE]
+
+// --- Configuration ---
+const char* ssid = "Velocity Wi-Fi";        // Updated WiFi name
+const char* password = "zpyvdzss";           // Updated WiFi password
+const char* hostname = "flamewerks-burner";
+
+// --- Burner State Machine (MODIFIED FOR SINGLE RELAY TESTING) ---
+enum BurnerState {
+  OFF,                // All systems off, safe state
+  PILOT_IGNITING,     // Opening pilot valve + igniter spark
+  PILOT_ON,           // Pilot flame confirmed and stable (TESTING MODE)
+  // PILOT_ESTABLISHED,  // (Standard mode - disabled for testing)
+  // MAIN_ON,           // (Standard mode - disabled for testing)
+  FLAMEOUT,          // Flame lost, cooldown period
+  FAULT              // System fault, manual reset required
+};
+
+// --- Burner Control Structure ---
+struct BurnerController {
+  int id;
+  BurnerState state;
+  unsigned long stateStartTime;
+  int retryAttempt;
+  bool flameDetected;
+  bool igniterActive;
+  bool pilotValveOpen;
+  bool mainValveOpen;
+  int lastFlameReading;
+};
+
+// Initialize single burner (expandable to multi-burner array)
+BurnerController burner = {1, OFF, 0, 0, false, false, false, false, 0};
+
+// --- Enhanced Safety Parameters ---
+const unsigned long PILOT_IGNITION_TIME_MS = 5000;   // 5 seconds for pilot ignition
+const unsigned long PILOT_STABILIZE_TIME_MS = 2000;  // 2 seconds to stabilize pilot
+const unsigned long FLAME_CHECK_INTERVAL_MS = 100;   // Check flame every 100ms
+const unsigned long FLAME_LOSS_TIMEOUT_MS = 500;     // 500ms to detect flame loss
+const unsigned long COOLDOWN_PERIOD_MS = 3000;       // 3 second cooldown between attempts
+const int MAX_IGNITION_ATTEMPTS = 3;                 // Maximum retry attempts
+const int FLAME_DETECTION_THRESHOLD = 25;            // Lowered from 50 for better flame sensitivity
+const int FLAME_HYSTERESIS = 3;                      // Reduced hysteresis for faster response
+
+// --- Signal Filtering Parameters ---
+const int FILTER_SAMPLES = 8;                        // Number of samples to average
+const int STABILITY_REQUIRED = 3;                    // Consecutive stable readings required
+const int MAX_NOISE_TOLERANCE = 15;                  // Maximum ADC variation to consider "stable"
+
+// --- Web Server ---
+ESP8266WebServer server(80);
+
+// --- Hardware Control Functions ---
+void setPilotValve(bool state) {
+  digitalWrite(PILOT_RELAY_PIN, state ? HIGH : LOW);
+  burner.pilotValveOpen = state;
+  Serial.print("Pilot valve: ");
+  Serial.println(state ? "OPEN" : "CLOSED");
+}
+
+void setMainValve(bool state) {
+  // WARNING: TESTING MODE: Main valve relay not connected
+  Serial.print("Main valve (SIMULATED): ");
+  Serial.println(state ? "OPEN" : "CLOSED");
+  Serial.println("   --> No hardware connected - command logged only");
+  
+  burner.mainValveOpen = state;  // Track state for web UI
+  
+  // digitalWrite(MAIN_RELAY_PIN, state ? HIGH : LOW);  // Disabled - no hardware
+}
+
+// Glow plug control function (using pin 4)
+void setGlowPlug(bool state) {
+  digitalWrite(MAIN_RELAY_PIN, state ? HIGH : LOW);  // Pin 4 controls glow plug circuit
+  Serial.print("Glow plug (Pin 4): ");
+  Serial.println(state ? "ON (3.3V signal -> 12V glow plug)" : "OFF (0V signal -> glow plug off)");
+  Serial.println("   NOTE: Pin 4 outputs 3.3V to control relay/MOSFET that switches 12V to glow plug");
+}
+
+void emergencyShutdown() {
+  setPilotValve(false);
+  setMainValve(false);
+  burner.state = OFF;
+  burner.retryAttempt = 0;
+  Serial.println("*** EMERGENCY SHUTDOWN - ALL SYSTEMS OFF ***");
+}
+
+bool readFlameStatus() {
+  // Multi-sample averaging for noise reduction
+  static int sampleBuffer[FILTER_SAMPLES];
+  static int sampleIndex = 0;
+  static bool bufferFilled = false;
+  static int stableFlameCount = 0;
+  static int stableNoFlameCount = 0;
+  static bool lastStableFlame = false;
+  
+  // Take current reading
+  int rawReading = analogRead(FLAME_SENSE_PIN);
+  
+  // Fill circular buffer
+  sampleBuffer[sampleIndex] = rawReading;
+  sampleIndex = (sampleIndex + 1) % FILTER_SAMPLES;
+  if (!bufferFilled && sampleIndex == 0) {
+    bufferFilled = true;
+  }
+  
+  // Calculate filtered reading (average of samples)
+  int total = 0;
+  int samplesUsed = bufferFilled ? FILTER_SAMPLES : sampleIndex;
+  for (int i = 0; i < samplesUsed; i++) {
+    total += sampleBuffer[i];
+  }
+  int filteredReading = total / samplesUsed;
+  
+  // Calculate noise level (standard deviation approximation)
+  int maxSample = 0, minSample = 1024;
+  for (int i = 0; i < samplesUsed; i++) {
+    if (sampleBuffer[i] > maxSample) maxSample = sampleBuffer[i];
+    if (sampleBuffer[i] < minSample) minSample = sampleBuffer[i];
+  }
+  int noiseLevel = maxSample - minSample;
+  
+  // Store for debugging
+  burner.lastFlameReading = filteredReading;
+  
+  // Enhanced floating pin detection (using filtered reading)
+  static int consecutiveMaxReadings = 0;
+  static int consecutiveMinReadings = 0;
+  static bool hasWarnedFloating = false;
+  
+  if (filteredReading >= 1020) {
+    consecutiveMaxReadings++;
+    consecutiveMinReadings = 0;
+  } else if (filteredReading <= 10) {
+    consecutiveMinReadings++;
+    consecutiveMaxReadings = 0;
+  } else {
+    consecutiveMaxReadings = 0;
+    consecutiveMinReadings = 0;
+  }
+  
+  // Floating pin warnings
+  if (consecutiveMaxReadings >= 3 && !hasWarnedFloating) {
+    Serial.println("*** WARNING: A0 PIN FLOATING! ***");
+    Serial.println("ADC reading stuck at maximum (1024) - A0 not properly connected");
+    Serial.println("CHECK: 1MΩ resistor from A0 to GND, flame rod to A0 connection");
+    hasWarnedFloating = true;
+  }
+  
+  if (consecutiveMinReadings >= 5 && hasWarnedFloating) {
+    Serial.println("*** A0 PIN STABILIZED - Good baseline readings ***");
+    hasWarnedFloating = false;
+  }
+  
+  // Determine potential flame state based on threshold
+  bool potentialFlame;
+  if (filteredReading >= 1020) {
+    potentialFlame = false; // Ignore floating readings
+  } else {
+    if (lastStableFlame) {
+      // Use hysteresis when turning off
+      potentialFlame = filteredReading > (FLAME_DETECTION_THRESHOLD - FLAME_HYSTERESIS);
+    } else {
+      // Use hysteresis when turning on
+      potentialFlame = filteredReading > (FLAME_DETECTION_THRESHOLD + FLAME_HYSTERESIS);
+    }
+  }
+  
+  // Require stability before changing state
+  bool isStable = (noiseLevel <= MAX_NOISE_TOLERANCE) && bufferFilled;
+  
+  if (isStable && potentialFlame) {
+    stableFlameCount++;
+    stableNoFlameCount = 0;
+  } else if (isStable && !potentialFlame) {
+    stableNoFlameCount++;
+    stableFlameCount = 0;
+  } else {
+    // Readings are not stable, don't change counters
+    // This prevents state changes during noisy periods
+  }
+  
+  // Change state only after consecutive stable readings
+  bool newFlameState = lastStableFlame; // Default to current state
+  
+  if (stableFlameCount >= STABILITY_REQUIRED) {
+    newFlameState = true;
+    stableFlameCount = STABILITY_REQUIRED; // Prevent overflow
+  } else if (stableNoFlameCount >= STABILITY_REQUIRED) {
+    newFlameState = false;
+    stableNoFlameCount = STABILITY_REQUIRED; // Prevent overflow
+  }
+  
+  // Report state changes immediately
+  if (newFlameState != lastStableFlame) {
+    if (newFlameState) {
+      Serial.print("🔥 STABLE FLAME DETECTED! Filtered ADC: ");
+      Serial.print(filteredReading);
+      Serial.print(" (Raw: ");
+      Serial.print(rawReading);
+      Serial.print(", Noise: ");
+      Serial.print(noiseLevel);
+      Serial.print(", Threshold: ");
+      Serial.print(FLAME_DETECTION_THRESHOLD);
+      Serial.println(") 🔥");
+    } else {
+      Serial.print("❄️ STABLE FLAME LOST - Filtered ADC: ");
+      Serial.print(filteredReading);
+      Serial.print(" (Raw: ");
+      Serial.print(rawReading);
+      Serial.print(", Noise: ");
+      Serial.print(noiseLevel);
+      Serial.print(", Below threshold: ");
+      Serial.print(FLAME_DETECTION_THRESHOLD);
+      Serial.println(") ❄️");
+    }
+    lastStableFlame = newFlameState;
+  }
+  
+  // Enhanced debug output every 3 seconds
+  static unsigned long lastDebugOutput = 0;
+  if (millis() - lastDebugOutput > 3000) {
+    Serial.print("Flame sensor - Raw: ");
+    Serial.print(rawReading);
+    Serial.print(" | Filtered: ");
+    Serial.print(filteredReading);
+    Serial.print(" | Noise: ");
+    Serial.print(noiseLevel);
+    Serial.print(" | Threshold: ");
+    Serial.print(FLAME_DETECTION_THRESHOLD);
+    Serial.print(" | Flame: ");
+    Serial.print(newFlameState ? "🔥 YES" : "❄️ NO");
+    Serial.print(" | Stability: ");
+    Serial.print(isStable ? "STABLE" : "NOISY");
+    if (filteredReading >= 1020) {
+      Serial.print(" [FLOATING - FIX A0!]");
+    }
+    Serial.println();
+    lastDebugOutput = millis();
+  }
+  
+  return newFlameState;
+}
+
+// --- Enhanced State Machine Logic (SINGLE RELAY VERSION) ---
+void updateBurnerStateMachine() {
+  unsigned long currentTime = millis();
+  
+  // Faster state machine updates for better flame responsiveness
+  static unsigned long lastStateMachineUpdate = 0;
+  if (currentTime - lastStateMachineUpdate < 250) {  // Changed from 1000ms to 250ms
+    return; // Update state machine every 250ms for faster flame response
+  }
+  lastStateMachineUpdate = currentTime;
+  
+  // Read flame status more frequently
+  burner.flameDetected = readFlameStatus();
+  
+  switch (burner.state) {
+    case OFF:
+      // Safe state - all systems off (only set once per state change)
+      static BurnerState lastState = FAULT; // Initialize to different state
+      if (lastState != OFF) {
+        setPilotValve(false);
+        setMainValve(false);
+        Serial.println("System in OFF state - Type 'help' for commands");
+        lastState = OFF;
+      }
+      break;
+      
+    case PILOT_IGNITING:
+      lastState = PILOT_IGNITING;
+      // Phase 1: Open pilot valve (flame rod is passive receiver only)
+      setPilotValve(true);
+      setMainValve(false);
+      
+      if (burner.flameDetected) {
+        // Pilot flame established! (Testing mode - stay in pilot)
+        burner.state = PILOT_ON;  // Modified for testing
+        burner.stateStartTime = currentTime;
+        burner.retryAttempt = 0;  // Reset retry counter
+        Serial.println("STATE: Pilot flame detected via flame rod -> PILOT_ON (TESTING MODE)");
+        Serial.println("   --> In production mode, this would proceed to main valve");
+      } 
+      else if (currentTime - burner.stateStartTime > PILOT_IGNITION_TIME_MS) {
+        // Ignition timeout
+        setPilotValve(false);
+        
+        if (burner.retryAttempt < MAX_IGNITION_ATTEMPTS) {
+          burner.retryAttempt++;
+          burner.state = FLAMEOUT;
+          burner.stateStartTime = currentTime;
+          Serial.print("STATE: Pilot ignition failed, attempt ");
+          Serial.print(burner.retryAttempt);
+          Serial.print("/");
+          Serial.println(MAX_IGNITION_ATTEMPTS);
+        } else {
+          burner.state = FAULT;
+          burner.stateStartTime = currentTime;
+          Serial.println("STATE: Maximum ignition attempts exceeded -> FAULT");
+        }
+      }
+      break;
+      
+    case PILOT_ON:
+      lastState = PILOT_ON;
+      // Testing mode: Pilot running, main valve simulated
+      setPilotValve(true);
+      setMainValve(true);  // Simulated only
+      
+      if (!burner.flameDetected) {
+        // Pilot flame lost!
+        emergencyShutdown();
+        burner.state = FLAMEOUT;
+        burner.stateStartTime = currentTime;
+        Serial.println("STATE: Pilot flame lost (flame rod) -> EMERGENCY FLAMEOUT");
+      }
+      break;
+      
+    case FLAMEOUT:
+      lastState = FLAMEOUT;
+      // Cooldown period before retry
+      setPilotValve(false);
+      setMainValve(false);
+      
+      if (currentTime - burner.stateStartTime > COOLDOWN_PERIOD_MS) {
+        if (burner.retryAttempt < MAX_IGNITION_ATTEMPTS) {
+          // Attempt restart
+          burner.state = PILOT_IGNITING;
+          burner.stateStartTime = currentTime;
+          Serial.println("STATE: Cooldown complete, retrying ignition -> PILOT_IGNITING");
+        } else {
+          burner.state = FAULT;
+          Serial.println("STATE: Maximum retries exceeded -> FAULT");
+        }
+      }
+      break;
+      
+    case FAULT:
+      lastState = FAULT;
+      // System fault - requires manual reset
+      setPilotValve(false);
+      setMainValve(false);
+      
+      // Fault state can only be cleared by manual reset command
+      break;
+  }
+}
+
+// --- Web Server Handlers ---
+void handleRoot() {
+  // Serve the web UI
+  server.sendHeader("Content-Type", "text/html");
+  server.send(200, "text/html", getWebUI());
+}
+
+void handleStatus() {
+  // Return enhanced status as JSON
+  String json = "[{";
+  json += "\"id\":1,";
+  json += "\"state\":\"";
+  
+  switch (burner.state) {
+    case OFF: json += "off"; break;
+    case PILOT_IGNITING: json += "igniting"; break;
+    case PILOT_ON: json += "pilot-running"; break;  // Modified for testing
+    case FLAMEOUT: json += "flameout"; break;
+    case FAULT: json += "fault"; break;
+  }
+  
+  json += "\",\"flame\":";
+  json += burner.flameDetected ? "true" : "false";
+  json += ",\"attempts\":";
+  json += String(burner.retryAttempt);
+  json += ",\"maxAttempts\":";
+  json += String(MAX_IGNITION_ATTEMPTS);
+  json += ",\"flameSensorValue\":";
+  json += String(burner.lastFlameReading);
+  json += ",\"igniterActive\":";
+  json += burner.igniterActive ? "true" : "false";
+  json += ",\"pilotOpen\":";
+  json += burner.pilotValveOpen ? "true" : "false";
+  json += ",\"mainOpen\":";
+  json += burner.mainValveOpen ? "true" : "false";
+  json += "}]";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleControl() {
+  String response = "";
+  
+  if (server.hasArg("cmd")) {
+    String cmd = server.arg("cmd");
+    
+    if (cmd == "ignite" || cmd == "on") {
+      if (burner.state == OFF || burner.state == FAULT) {
+        burner.state = PILOT_IGNITING;
+        burner.stateStartTime = millis();
+        burner.retryAttempt = 0;
+        response = "Ignition sequence initiated - Pilot valve opening";
+        Serial.println("WEB COMMAND: Starting ignition sequence");
+      } else {
+        response = "Burner already active or in ignition process";
+      }
+    }
+    else if (cmd == "stop" || cmd == "off") {
+      emergencyShutdown();
+      response = "Emergency shutdown executed - All systems OFF";
+      Serial.println("WEB COMMAND: Emergency shutdown");
+    }
+    else if (cmd == "reset") {
+      if (burner.state == FAULT) {
+        burner.state = OFF;
+        burner.retryAttempt = 0;
+        response = "System reset from FAULT to OFF state";
+        Serial.println("WEB COMMAND: Fault reset to OFF");
+      } else {
+        response = "Reset command only available in FAULT state";
+      }
+    }
+    else {
+      response = "Unknown command: " + cmd + " (use: ignite, stop, reset)";
+    }
+  } else {
+    response = "Missing cmd parameter";
+  }
+  
+  server.send(200, "text/plain", response);
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "File not found");
+}
+
+// --- Serial Command Interface ---
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    cmd.toLowerCase();
+    
+    if (cmd == "i" || cmd == "ignite") {
+      if (burner.state == OFF || burner.state == FAULT) {
+        burner.state = PILOT_IGNITING;
+        burner.stateStartTime = millis();
+        burner.retryAttempt = 0;
+        Serial.println("SERIAL: Ignition sequence started");
+      } else {
+        Serial.println("SERIAL: Burner already active");
+      }
+    }
+    else if (cmd == "s" || cmd == "stop" || cmd == "off") {
+      emergencyShutdown();
+      Serial.println("SERIAL: Emergency shutdown executed");
+    }
+    else if (cmd == "r" || cmd == "reset") {
+      burner.state = OFF;
+      burner.retryAttempt = 0;
+      Serial.println("SERIAL: System reset to OFF");
+    }
+    else if (cmd == "status" || cmd == "st") {
+      Serial.println("=== FLAMEWERKS BURNER STATUS ===");
+      
+      // Add WiFi status first
+      Serial.print("WiFi Status: ");
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("CONNECTED to ");
+        Serial.println(WiFi.SSID());
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("Web UI: http://");
+        Serial.println(WiFi.localIP());
+      } else {
+        Serial.println("DISCONNECTED");
+        Serial.print("Trying to connect to: ");
+        Serial.println(ssid);
+      }
+      Serial.println("--------------------------------");
+      
+      Serial.print("State: ");
+      switch (burner.state) {
+        case OFF: Serial.println("OFF"); break;
+        case PILOT_IGNITING: Serial.println("PILOT_IGNITING"); break;
+        case PILOT_ON: Serial.println("PILOT_ON (TESTING MODE)"); break;
+        case FLAMEOUT: Serial.println("FLAMEOUT"); break;
+        case FAULT: Serial.println("FAULT"); break;
+      }
+      Serial.print("Flame detected: ");
+      Serial.println(burner.flameDetected ? "YES" : "NO");
+      Serial.print("Flame sensor ADC: ");
+      Serial.println(burner.lastFlameReading);
+      Serial.print("Ignition attempts: ");
+      Serial.print(burner.retryAttempt);
+      Serial.print("/");
+      Serial.println(MAX_IGNITION_ATTEMPTS);
+      Serial.print("Hardware status - Flame Rod: ");
+      Serial.print(digitalRead(FLAME_ROD_OUT_PIN) ? "ACTIVE" : "OFF");
+      Serial.print(", Pilot: ");
+      Serial.print(burner.pilotValveOpen ? "OPEN" : "CLOSED");
+      Serial.print(", Main: ");
+      Serial.println(burner.mainValveOpen ? "OPEN" : "CLOSED");
       Serial.println("==============================");
     }
-    else if (cmd == "flame_levels" || cmd == "fl") {
-      testFlameRodLevels();
+    else if (cmd == "help" || cmd == "h") {
+      Serial.println("=== FLAMEWERKS SERIAL COMMANDS ===");
+      Serial.println("i/ignite     - Start ignition sequence");
+      Serial.println("s/stop       - Emergency shutdown");
+      Serial.println("r/reset      - Reset system to OFF");
+      Serial.println("status/st    - Show detailed status");
+      Serial.println("test         - Basic flame sensor test");
+      Serial.println("flame_test   - Detailed flame sensor analysis");
+      Serial.println("flame_test_live - Live flame monitoring with filtering");
+      Serial.println("noise_test   - Analyze signal noise for 30 seconds");
+      Serial.println("flame_cal    - Calibrate flame sensor");
+      Serial.println("flame_continuous - Continuous flame monitoring");
+      Serial.println("test_no_flame    - Test baseline with no flame");
+      Serial.println("a0_test          - Enhanced A0 pin stability test (20 readings)");
+      Serial.println("wiring_test      - Diagnose A0 pin wiring issues");
+      Serial.println("glow_on      - Turn glow plug ON (pin 4)");
+      Serial.println("glow_off     - Turn glow plug OFF (pin 4)");
+      Serial.println("glow_test    - Test glow plug control sequence");
+      Serial.println("pin_test     - Test all GPIO pin outputs");
+      Serial.println("help/h       - Show this help");
+      Serial.println("===================================");
     }
-    else if (cmd.startsWith("flame_level ")) {
-      // Extract level number from command like "flame_level 2"
-      String levelStr = cmd.substring(12); // Remove "flame_level "
-      int level = levelStr.toInt();
-      if (level >= 0 && level <= 4) {
-        setFlameRodOutputLevel(level);
-        
-        // Show immediate reading
-        delay(100); // Let output stabilize
+    else if (cmd == "test") {
+      Serial.println("=== FLAME ROD TEST ===");
+      Serial.println("Testing flame rod rectification circuit...");
+      Serial.println("NOTE: Flame rod is passive receiver - bring flame close to test");
+      for (int i = 0; i < 10; i++) {
         int reading = analogRead(FLAME_SENSE_PIN);
-        Serial.print("Immediate sensor reading: ");
+        Serial.print("Reading ");
+        Serial.print(i + 1);
+        Serial.print(": ");
         Serial.print(reading);
-        Serial.print(" (Detected: ");
+        Serial.print(" (Threshold: ");
+        Serial.print(FLAME_DETECTION_THRESHOLD);
+        Serial.print(", Detected: ");
         Serial.print(reading > FLAME_DETECTION_THRESHOLD ? "YES" : "NO");
         Serial.println(")");
-      } else {
-        Serial.println("Invalid level. Use 0-4: 0=OFF, 1=LOW, 2=MED, 3=HIGH, 4=FULL");
+        delay(500);
       }
-    }
-    else if (cmd == "flame_test" || cmd == "ft") {
-      testFlameRodDetailed();
-    }
-    else if (cmd == "flame_cal" || cmd == "fc") {
-      calibrateFlameRod();
-    }
-    else if (cmd == "flame_on") {
-      setFlameRodOutput(true);
-      Serial.println("Flame rod output turned ON (3.3V)");
-    }
-    else if (cmd == "flame_off") {
-      setFlameRodOutput(false);
-      Serial.println("Flame rod output turned OFF (0V)");
-    }
-    else if (cmd == "flame_test" || cmd == "ft") {
-      testFlameRodDetailed();
+      Serial.println("========================");
     }
     else if (cmd == "flame_cal" || cmd == "fc") {
       calibrateFlameRod();
@@ -1216,12 +2585,10 @@ void setup() {
   // Initialize GPIO pins
   pinMode(PILOT_RELAY_PIN, OUTPUT);
   pinMode(MAIN_RELAY_PIN, OUTPUT);  // Pin 4 - Now enabled for glow plug control
-  pinMode(IGNITER_PIN, OUTPUT);
   
   // Ensure all outputs start OFF
   setPilotValve(false);
   setMainValve(false);
-  setFlameRodOutput(false);
   setGlowPlug(false);  // Initialize glow plug to OFF
   
   // Initialize burner controller
@@ -1236,6 +2603,7 @@ void setup() {
   Serial.println("Hardware initialized - Single relay testing mode");
   Serial.println("WARNING: PILOT VALVE ONLY - Main valve simulated");
   Serial.println("   Connect 2nd relay to GPIO4 for full operation");
+  Serial.println("   Flame rod is PASSIVE RECEIVER ONLY");
   
   // Connect to WiFi
   WiFi.mode(WIFI_STA);
@@ -1282,6 +2650,200 @@ void setup() {
   Serial.println("\n=== System Ready ===");
   Serial.println("Commands: i=ignite, e=stop, r=reset, s=status, help");
   Serial.println("Web UI: http://" + WiFi.localIP().toString() + "/");
+  Serial.println("========================\n");
+}
+
+// --- Main Loop ---
+void loop() {
+  // Handle web server requests
+  server.handleClient();
+  
+  // Handle mDNS
+  MDNS.update();
+  
+  // Handle serial commands
+  handleSerialCommands();
+  
+  // Update burner state machine
+  updateBurnerStateMachine();
+  
+  // Small delay to prevent excessive CPU usage
+  delay(50);
+}
+
+// --- Flame Rod Testing Functions ---
+void testFlameRodDetailed() {
+  Serial.println("\n=== DETAILED FLAME ROD TEST ===");
+  Serial.println("Testing flame rectification circuit...");
+  Serial.println("Format: Sample | ADC | Status | Output");
+  Serial.println("=====================================");
+  
+  int total = 0;
+  int minVal = 1024;
+  int maxVal = 0;
+  int flameCount = 0;
+  
+  for (int i = 0; i < 20; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    bool detected = reading > FLAME_DETECTION_THRESHOLD;
+    bool rodActive = digitalRead(FLAME_ROD_OUT_PIN);
+    
+    total += reading;
+    if (reading < minVal) minVal = reading;
+    if (reading > maxVal) maxVal = reading;
+    if (detected) flameCount++;
+    
+    Serial.print("  ");
+    Serial.print(i + 1);
+    Serial.print("   | ");
+    Serial.print(reading);
+    if (reading < 100) Serial.print(" ");
+    if (reading < 10) Serial.print(" ");
+    Serial.print(" | ");
+    Serial.print(detected ? "FLAME" : "none ");
+    Serial.print(" | ");
+    Serial.println(rodActive ? "3.3V" : "0V");
+    
+    delay(500);
+  }
+  
+  int average = total / 20;
+  
+  Serial.println("\n--- FLAME ROD ANALYSIS ---");
+  Serial.print("Average: ");
+  Serial.print(average);
+  Serial.print(" | Range: ");
+  Serial.print(minVal);
+  Serial.print("-");
+  Serial.print(maxVal);
+  Serial.print(" | Span: ");
+  Serial.println(maxVal - minVal);
+  Serial.print("Threshold: ");
+  Serial.print(FLAME_DETECTION_THRESHOLD);
+  Serial.print(" | Detection rate: ");
+  Serial.print(flameCount);
+  Serial.print("/20 (");
+  Serial.print((flameCount * 100) / 20);
+  Serial.println("%)");
+  
+  Serial.println("\n--- CIRCUIT ASSESSMENT ---");
+  if (maxVal - minVal < 30) {
+    Serial.println("WARNING: Very low variation - check flame rod wiring");
+    Serial.println("   - Verify 1MΩ resistor connection");
+    Serial.println("   - Check flame rod probe contact");
+  } else if (maxVal - minVal > 100) {
+    Serial.println("GOOD: Good signal variation - flame rod working");
+  } else {
+    Serial.println("INFO: Moderate variation - acceptable operation");
+  }
+  
+  if (average < 30) {
+    Serial.println("INFO: Low baseline - good for flame detection");
+  } else if (average > 100) {
+    Serial.println("WARNING: High baseline - may need threshold adjustment");
+  }
+  
+  Serial.println("===============================");
+}
+
+void calibrateFlameRod() {
+  Serial.println("\n=== FLAME ROD CALIBRATION ===");
+  Serial.println("This will determine optimal flame detection threshold");
+  Serial.println("NOTE: Flame rod is passive receiver only");
+  
+  // Step 1: No flame reading
+  Serial.println("\nSTEP 1: NO FLAME BASELINE");
+  Serial.println("Ensure no flame or heat source is near the flame rod...");
+  delay(2000);
+  
+  Serial.println("Taking baseline readings (no flame)...");
+  int noFlameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    noFlameTotal += reading;
+    Serial.print("No flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int noFlameAverage = noFlameTotal / 10;
+  
+  Serial.print("GOOD: No flame average: ");
+  Serial.println(noFlameAverage);
+  
+  // Step 2: With flame reading
+  Serial.println("\nSTEP 2: FLAME DETECTION");
+  Serial.println("Light flame near flame rod probe...");
+  Serial.println("Press any key when flame is stable...");
+  
+  while (!Serial.available()) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    Serial.print("Current reading: ");
+    Serial.print(reading);
+    Serial.println(" (bring flame closer to rod)");
+    delay(1000);
+  }
+  while (Serial.available()) Serial.read(); // Clear buffer
+  
+  Serial.println("Taking flame readings...");
+  int flameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    flameTotal += reading;
+    Serial.print("With flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int flameAverage = flameTotal / 10;
+  
+  Serial.print("GOOD: Flame average: ");
+  Serial.println(flameAverage);
+  
+  // Calculate results
+  int difference = flameAverage - noFlameAverage;
+  int recommendedThreshold = noFlameAverage + (difference / 3); // 33% above baseline
+  
+  Serial.println("\n--- CALIBRATION RESULTS ---");
+  Serial.print("No flame: ");
+  Serial.print(noFlameAverage);
+  Serial.print(" | With flame: ");
+  Serial.println(flameAverage);
+  Serial.print("Difference: ");
+  Serial.print(difference);
+  Serial.print(" | Ratio: ");
+  if (noFlameAverage > 0) {
+    Serial.print((float)flameAverage / noFlameAverage, 1);
+    Serial.println(":1");
+  } else {
+    Serial.println("N/A");
+  }
+  
+  Serial.print("Current threshold: ");
+  Serial.println(FLAME_DETECTION_THRESHOLD);
+  Serial.print("Recommended threshold: ");
+  Serial.println(recommendedThreshold);
+  
+  if (difference < 20) {
+    Serial.println("\nPOOR: Very small flame signal");
+    Serial.println("   Check: Flame rod position, 1MΩ resistor, connections");
+    Serial.println("   Try holding flame closer to the rod probe");
+  } else if (difference < 50) {
+    Serial.println("\nWARNING: MARGINAL: Weak flame signal");
+    Serial.println("   Consider: Better flame rod positioning closer to flame");
+  } else {
+    Serial.println("\nGOOD: Strong flame rectification signal");
+  }
+  
+  Serial.println("\n--- UPDATE FIRMWARE ---");
+  Serial.println("To use new threshold, change this line:");
+  Serial.print("const int FLAME_DETECTION_THRESHOLD = ");
+  Serial.print(recommendedThreshold);
+  Serial.println(";");
+  Serial.println("============================");
+}
   Serial.println("========================\n");
 }
 
@@ -1587,3 +3149,596 @@ void testFlameRodLevels() {
   Serial.println("\nFlame rod output returned to OFF");
   Serial.println("=============================");
 }
+  Serial.println("Taking baseline readings (no flame)...");
+  int noFlameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    noFlameTotal += reading;
+    Serial.print("No flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int noFlameAverage = noFlameTotal / 10;
+  
+  Serial.print("GOOD: No flame average: ");
+  Serial.println(noFlameAverage);
+  
+  // Step 2: With flame reading
+  Serial.println("\nSTEP 2: FLAME DETECTION");
+  Serial.println("Light flame near flame rod probe...");
+  Serial.println("Press any key when flame is stable...");
+  
+  while (!Serial.available()) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    Serial.print("Current reading: ");
+    Serial.print(reading);
+    Serial.print(" (Rod: ");
+    Serial.print(digitalRead(FLAME_ROD_OUT_PIN) ? "ON" : "OFF");
+    Serial.println(")");
+    delay(1000);
+  }
+  while (Serial.available()) Serial.read(); // Clear buffer
+  
+  Serial.println("Taking flame readings...");
+  int flameTotal = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    flameTotal += reading;
+    Serial.print("With flame ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(reading);
+    delay(300);
+  }
+  int flameAverage = flameTotal / 10;
+  
+  Serial.print("GOOD: Flame average: ");
+  Serial.println(flameAverage);
+  
+  // Calculate results
+  int difference = flameAverage - noFlameAverage;
+  int recommendedThreshold = noFlameAverage + (difference / 3); // 33% above baseline
+  
+  Serial.println("\n--- CALIBRATION RESULTS ---");
+  Serial.print("No flame: ");
+  Serial.print(noFlameAverage);
+  Serial.print(" | With flame: ");
+  Serial.println(flameAverage);
+  Serial.print("Difference: ");
+  Serial.print(difference);
+  Serial.print(" | Ratio: ");
+  if (noFlameAverage > 0) {
+    Serial.print((float)flameAverage / noFlameAverage, 1);
+    Serial.println(":1");
+  } else {
+    Serial.println("N/A");
+  }
+  
+  Serial.print("Current threshold: ");
+  Serial.println(FLAME_DETECTION_THRESHOLD);
+  Serial.print("Recommended threshold: ");
+  Serial.println(recommendedThreshold);
+  
+  if (difference < 20) {
+    Serial.println("\nPOOR: Very small flame signal");
+    Serial.println("   Check: Flame rod in flame path, 1MΩ resistor, connections");
+  } else if (difference < 50) {
+    Serial.println("\nWARNING: MARGINAL: Weak flame signal");
+    Serial.println("   Consider: Better flame rod position, AC voltage source");
+  } else {
+    Serial.println("\nGOOD: Strong flame rectification signal");
+  }
+  
+  Serial.println("\n--- UPDATE FIRMWARE ---");
+  Serial.println("To use new threshold, change this line:");
+  Serial.print("const int FLAME_DETECTION_THRESHOLD = ");
+  Serial.print(recommendedThreshold);
+  Serial.println(";");
+  Serial.println("============================");
+  
+  setFlameRodOutput(false); // Turn off flame rod after calibration
+}
+
+// --- Flame Rod Level Testing Function ---
+void testFlameRodLevels() {
+  Serial.println("\n=== FLAME ROD OUTPUT LEVEL TEST ===");
+  Serial.println("Testing different flame rod output levels...");
+  Serial.println("This simulates different flame intensities for sensor calibration");
+  Serial.println("Format: Level | Output | ADC Reading | Detected | Notes");
+  Serial.println("========================================================");
+  
+  // Test each level for 3 seconds with readings
+  int levels[] = {0, 1, 2, 3, 4};
+  String levelNames[] = {"OFF", "LOW", "MEDIUM", "HIGH", "FULL"};
+  String voltages[] = {"0V", "~0.8V", "~1.6V", "~2.5V", "3.3V"};
+  
+  for (int i = 0; i < 5; i++) {
+    Serial.print("\n--- Testing Level ");
+    Serial.print(levels[i]);
+    Serial.print(" (");
+    Serial.print(levelNames[i]);
+    Serial.print(" - ");
+    Serial.print(voltages[i]);
+    Serial.println(") ---");
+    
+    setFlameRodOutputLevel(levels[i]);
+    delay(500); // Let output stabilize
+    
+    // Take 5 readings over 2.5 seconds
+    int total = 0;
+    int maxReading = 0;
+    int minReading = 1024;
+    int detectedCount = 0;
+    
+    for (int j = 0; j < 5; j++) {
+      int reading = analogRead(FLAME_SENSE_PIN);
+      bool detected = reading > FLAME_DETECTION_THRESHOLD;
+      
+      total += reading;
+      if (reading > maxReading) maxReading = reading;
+      if (reading < minReading) minReading = reading;
+      if (detected) detectedCount++;
+      
+      Serial.print("  Reading ");
+      Serial.print(j + 1);
+      Serial.print(": ");
+      Serial.print(reading);
+      Serial.print(" | ");
+      Serial.print(detected ? "FLAME" : "none ");
+      
+      if (j == 0) {
+        // Add interpretation for first reading
+        if (levels[i] == 0 && reading < 20) {
+          Serial.print(" | GOOD: Good baseline");
+        } else if (levels[i] > 0 && reading > FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | GOOD: Good flame signal");
+        } else if (levels[i] > 0 && reading <= FLAME_DETECTION_THRESHOLD) {
+          Serial.print(" | WARNING: Weak signal");
+        }
+      }
+      Serial.println();
+      
+      delay(500);
+    }
+    
+    int average = total / 5;
+    Serial.print("  Summary - Avg: ");
+    Serial.print(average);
+    Serial.print(" | Range: ");
+    Serial.print(minReading);
+    Serial.print("-");
+    Serial.print(maxReading);
+    Serial.print(" | Detection: ");
+    Serial.print(detectedCount);
+    Serial.println("/5");
+    
+    // Analysis
+    if (levels[i] == 0) {
+      if (average < 30) {
+        Serial.println("  GOOD: Good baseline - low noise");
+      } else {
+        Serial.println("  WARNING: High baseline - check wiring");
+      }
+    } else {
+      int signalIncrease = average - 20; // Assume ~20 baseline
+      if (signalIncrease > 50) {
+        Serial.println("  GOOD: Strong signal increase");
+      } else if (signalIncrease > 20) {
+        Serial.println("  INFO: Moderate signal increase");
+      } else {
+        Serial.println("  PROBLEM: Weak signal - check circuit");
+      }
+    }
+  }
+  
+  Serial.println("\n=== TEST COMPLETE ===");
+  Serial.println("Analysis:");
+  Serial.println("- Level 0 should show low baseline readings");
+  Serial.println("- Higher levels should show increasing ADC values");
+  Serial.println("- Flame detection should trigger at higher levels");
+  Serial.println("- If all levels show similar readings, check:");
+  Serial.println("  * 1MΩ resistor connection");
+  Serial.println("  * A0 pin wiring");
+  Serial.println("  * GPIO5 output circuit");
+  
+  // Return to OFF state
+  setFlameRodOutputLevel(0);
+  Serial.println("\nFlame rod output returned to OFF");
+  Serial.println("=============================");
+}
+
+
+
+
+
+current errors 
+
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:819:38: warning: character constant too long for its type
+  819 |         const response = await fetch('/status');
+      |                                      ^~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:823:50: warning: character constant too long for its type
+  823 |         const statusEl = document.getElementById('burner1Status');
+      |                                                  ^~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:824:49: warning: character constant too long for its type
+  824 |         const flameEl = document.getElementById('burner1Flame');
+      |                                                 ^~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:825:51: warning: character constant too long for its type
+  825 |         const retriesEl = document.getElementById('burner1Retries');
+      |                                                   ^~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:827:27: error: empty character constant
+  827 |         let statusClass = '';
+      |                           ^~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:828:26: error: empty character constant
+  828 |         let statusText = '';
+      |                          ^~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:830:16: warning: multi-character character constant [-Wmultichar]
+  830 |           case 'off': statusClass = 'status-off'; statusText = 'OFF'; break;
+      |                ^~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:830:37: warning: character constant too long for its type
+  830 |           case 'off': statusClass = 'status-off'; statusText = 'OFF'; break;
+      |                                     ^~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:830:64: warning: multi-character character constant [-Wmultichar]
+  830 |           case 'off': statusClass = 'status-off'; statusText = 'OFF'; break;
+      |                                                                ^~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:831:16: warning: character constant too long for its type
+  831 |           case 'igniting': statusClass = 'status-igniting'; statusText = 'IGNITING PILOT...'; break;
+      |                ^~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:831:42: warning: character constant too long for its type
+  831 |           case 'igniting': statusClass = 'status-igniting'; statusText = 'IGNITING PILOT...'; break;
+      |                                          ^~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:831:74: warning: character constant too long for its type
+  831 |           case 'igniting': statusClass = 'status-igniting'; statusText = 'IGNITING PILOT...'; break;
+      |                                                                          ^~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:832:16: warning: character constant too long for its type
+  832 |           case 'pilot-running': statusClass = 'status-on'; statusText = 'PILOT RUNNING (TEST)'; break;
+      |                ^~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:832:47: warning: character constant too long for its type
+  832 |           case 'pilot-running': statusClass = 'status-on'; statusText = 'PILOT RUNNING (TEST)'; break;
+      |                                               ^~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:832:73: warning: character constant too long for its type
+  832 |           case 'pilot-running': statusClass = 'status-on'; statusText = 'PILOT RUNNING (TEST)'; break;
+      |                                                                         ^~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:833:16: warning: character constant too long for its type
+  833 |           case 'flameout': statusClass = 'status-fault'; statusText = 'FLAMEOUT'; break;
+      |                ^~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:833:42: warning: character constant too long for its type
+  833 |           case 'flameout': statusClass = 'status-fault'; statusText = 'FLAMEOUT'; break;
+      |                                          ^~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:833:71: warning: character constant too long for its type
+  833 |           case 'flameout': statusClass = 'status-fault'; statusText = 'FLAMEOUT'; break;
+      |                                                                       ^~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:834:16: warning: character constant too long for its type
+  834 |           case 'fault': statusClass = 'status-fault'; statusText = 'FAULT - RESET REQUIRED'; break;
+      |                ^~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:834:39: warning: character constant too long for its type
+  834 |           case 'fault': statusClass = 'status-fault'; statusText = 'FAULT - RESET REQUIRED'; break;
+      |                                       ^~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:834:68: warning: character constant too long for its type
+  834 |           case 'fault': statusClass = 'status-fault'; statusText = 'FAULT - RESET REQUIRED'; break;
+      |                                                                    ^~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:835:34: warning: character constant too long for its type
+  835 |           default: statusClass = 'status-off'; statusText = 'UNKNOWN'; break;
+      |                                  ^~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:835:61: warning: character constant too long for its type
+  835 |           default: statusClass = 'status-off'; statusText = 'UNKNOWN'; break;
+      |                                                             ^~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:838:30: warning: character constant too long for its type
+  838 |         statusEl.className = 'burner-status ' + statusClass;
+      |                              ^~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:841:54: warning: character constant too long for its type
+  841 |         const flameIndicator = flameEl.querySelector('.flame-indicator');
+      |                                                      ^~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:842:36: warning: character constant too long for its type
+  842 |         flameIndicator.className = 'flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no');
+      |                                    ^~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:842:73: warning: character constant too long for its type
+  842 |         flameIndicator.className = 'flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no');
+      |                                                                         ^~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:842:87: warning: character constant too long for its type
+  842 |         flameIndicator.className = 'flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no');
+      |                                                                                       ^~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:843:29: warning: character constant too long for its type
+  843 |         flameEl.innerHTML = 'Flame: <span class="flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no') + '"></span> ' + (burner.flame ? 'DETECTED' : 'NONE') + ' (ADC: ' + (burner.flameSensorValue || 'N/A') + ')';
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:843:86: warning: character constant too long for its type
+  843 |         flameEl.innerHTML = 'Flame: <span class="flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no') + '"></span> ' + (burner.flame ? 'DETECTED' : 'NONE') + ' (ADC: ' + (burner.flameSensorValue || 'N/A') + ')';
+      |                                                                                      ^~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:843:100: warning: character constant too long for its type
+  843 |         flameEl.innerHTML = 'Flame: <span class="flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no') + '"></span> ' + (burner.flame ? 'DETECTED' : 'NONE') + ' (ADC: ' + (burner.flameSensorValue || 'N/A') + ')';
+      |                                                                                                    ^~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:843:114: warning: character constant too long for its type
+  843 |         flameEl.innerHTML = 'Flame: <span class="flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no') + '"></span> ' + (burner.flame ? 'DETECTED' : 'NONE') + ' (ADC: ' + (burner.flameSensorValue || 'N/A') + ')';
+      |                                                                                                                  ^~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:843:145: warning: character constant too long for its type
+  843 |         flameEl.innerHTML = 'Flame: <span class="flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no') + '"></span> ' + (burner.flame ? 'DETECTED' : 'NONE') + ' (ADC: ' + (burner.flameSensorValue || 'N/A') + ')';
+      |                                                                                                                                                 ^~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:843:158: warning: multi-character character constant [-Wmultichar]
+  843 |         flameEl.innerHTML = 'Flame: <span class="flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no') + '"></span> ' + (burner.flame ? 'DETECTED' : 'NONE') + ' (ADC: ' + (burner.flameSensorValue || 'N/A') + ')';
+      |                                                                                                                                                              ^~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:843:168: warning: character constant too long for its type
+  843 |         flameEl.innerHTML = 'Flame: <span class="flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no') + '"></span> ' + (burner.flame ? 'DETECTED' : 'NONE') + ' (ADC: ' + (burner.flameSensorValue || 'N/A') + ')';
+      |                                                                                                                                                                        ^~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:843:208: warning: multi-character character constant [-Wmultichar]
+  843 |         flameEl.innerHTML = 'Flame: <span class="flame-indicator ' + (burner.flame ? 'flame-yes' : 'flame-no') + '"></span> ' + (burner.flame ? 'DETECTED' : 'NONE') + ' (ADC: ' + (burner.flameSensorValue || 'N/A') + ')';
+      |                                                                                                                                                                                                                ^~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:845:33: warning: character constant too long for its type
+  845 |         retriesEl.textContent = 'Attempts: ' + burner.attempts + '/' + burner.maxAttempts;
+      |                                 ^~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:847:33: warning: character constant too long for its type
+  847 |         document.getElementById('systemStatus').textContent =
+      |                                 ^~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:848:11: warning: character constant too long for its type
+  848 |           'Burner 1: ' + statusText + ' | Flame: ' + (burner.flame ? 'Detected' : 'None') + ' | IP: ' + location.hostname;
+      |           ^~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:848:39: warning: character constant too long for its type
+  848 |           'Burner 1: ' + statusText + ' | Flame: ' + (burner.flame ? 'Detected' : 'None') + ' | IP: ' + location.hostname;
+      |                                       ^~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:848:70: warning: character constant too long for its type
+  848 |           'Burner 1: ' + statusText + ' | Flame: ' + (burner.flame ? 'Detected' : 'None') + ' | IP: ' + location.hostname;
+      |                                                                      ^~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:848:83: warning: multi-character character constant [-Wmultichar]
+  848 |           'Burner 1: ' + statusText + ' | Flame: ' + (burner.flame ? 'Detected' : 'None') + ' | IP: ' + location.hostname;
+      |                                                                                   ^~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:848:93: warning: character constant too long for its type
+  848 |           'Burner 1: ' + statusText + ' | Flame: ' + (burner.flame ? 'Detected' : 'None') + ' | IP: ' + location.hostname;
+      |                                                                                             ^~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:851:23: warning: character constant too long for its type
+  851 |         console.error('Status update failed:', error);
+      |                       ^~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:852:33: warning: character constant too long for its type
+  852 |         document.getElementById('systemStatus').textContent = 'Connection Error - Check firmware';
+      |                                 ^~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:852:63: warning: character constant too long for its type
+  852 |         document.getElementById('systemStatus').textContent = 'Connection Error - Check firmware';
+      |                                                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:858:38: warning: character constant too long for its type
+  858 |         const response = await fetch('/control', {
+      |                                      ^~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:859:19: warning: multi-character character constant [-Wmultichar]
+  859 |           method: 'POST',
+      |                   ^~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:860:22: warning: character constant too long for its type
+  860 |           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      |                      ^~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:860:38: warning: character constant too long for its type
+  860 |           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      |                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:861:17: warning: multi-character character constant [-Wmultichar]
+  861 |           body: 'cmd=' + cmd
+      |                 ^~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:864:21: warning: character constant too long for its type
+  864 |         console.log('Command result:', result);
+      |                     ^~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:865:33: warning: character constant too long for its type
+  865 |         document.getElementById('systemStatus').textContent = result;
+      |                                 ^~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:868:23: warning: character constant too long for its type
+  868 |         console.error('Command failed:', error);
+      |                       ^~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:869:15: warning: character constant too long for its type
+  869 |         alert('Command failed - check ESP8266 connection');
+      |               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:874:19: warning: character constant too long for its type
+  874 |       if (confirm('Start ignition sequence?')) {
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:875:21: warning: character constant too long for its type
+  875 |         sendCommand('ignite');
+      |                     ^~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:879:19: warning: character constant too long for its type
+  879 |       if (confirm('Emergency shutdown?')) {
+      |                   ^~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:880:21: warning: multi-character character constant [-Wmultichar]
+  880 |         sendCommand('stop');
+      |                     ^~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:884:19: warning: character constant too long for its type
+  884 |       if (confirm('Reset system from FAULT state?')) {
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:885:21: warning: character constant too long for its type
+  885 |         sendCommand('reset');
+      |                     ^~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:889:19: warning: character constant too long for its type
+  889 |       if (confirm('EMERGENCY STOP will immediately shut off all systems!')) {
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:890:21: warning: multi-character character constant [-Wmultichar]
+  890 |         sendCommand('stop');
+      |                     ^~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:896:12: warning: missing terminating " character
+  896 | )rawliteral";
+      |            ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:896:12: error: missing terminating " character
+  896 | )rawliteral";
+      |            ^~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino: In function 'void handleRoot()':
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:403:33: error: 'getWebUI' was not declared in this scope
+  403 |   server.send(200, "text/html", getWebUI());
+      |                                 ^~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino: In function 'void handleSerialCommands()':
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:596:7: error: 'testFlameRodDetailed' was not declared in this scope; did you mean 'testFlameRodLevels'?
+  596 |       testFlameRodDetailed();
+      |       ^~~~~~~~~~~~~~~~~~~~
+      |       testFlameRodLevels
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:797:5: error: expected '(' before '<' token
+  797 |     </div>
+      |     ^
+      |     (
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:815:5: error: 'updateStatus' was not declared in this scope
+  815 |     updateStatus();
+      |     ^~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:817:5: error: 'async' was not declared in this scope
+  817 |     async function updateStatus() {
+      |     ^~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:856:10: error: expected ';' before 'function'
+  856 |     async function sendCommand(cmd) {
+      |          ^~~~~~~~~
+      |          ;
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:873:5: error: 'function' was not declared in this scope; did you mean 'std::function'?
+  873 |     function startIgnition() {
+      |     ^~~~~~~~
+      |     std::function
+In file included from c:\users\axelc\appdata\local\arduino15\packages\esp8266\tools\xtensa-lx106-elf-gcc\3.1.0-gcc10.3-e5f9fec\xtensa-lx106-elf\include\c++\10.3.0\functional:59,
+                 from c:\users\axelc\appdata\local\arduino15\packages\esp8266\tools\xtensa-lx106-elf-gcc\3.1.0-gcc10.3-e5f9fec\xtensa-lx106-elf\include\c++\10.3.0\pstl\glue_algorithm_defs.h:13,
+                 from c:\users\axelc\appdata\local\arduino15\packages\esp8266\tools\xtensa-lx106-elf-gcc\3.1.0-gcc10.3-e5f9fec\xtensa-lx106-elf\include\c++\10.3.0\algorithm:74,
+                 from C:\Users\AxelC\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Arduino.h:229,
+                 from C:\Users\AxelC\AppData\Local\arduino\sketches\D90C7BD1D892B3A4FE57CDF3908B3CDF\sketch\AppFirmware8-5.ino.cpp:1:
+c:\users\axelc\appdata\local\arduino15\packages\esp8266\tools\xtensa-lx106-elf-gcc\3.1.0-gcc10.3-e5f9fec\xtensa-lx106-elf\include\c++\10.3.0\bits\std_function.h:113:11: note: 'std::function' declared here
+  113 |     class function;
+      |           ^~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:878:13: error: expected ';' before 'stopBurner'
+  878 |     function stopBurner() {
+      |             ^~~~~~~~~~~
+      |             ;
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:883:13: error: expected ';' before 'resetBurner'
+  883 |     function resetBurner() {
+      |             ^~~~~~~~~~~~
+      |             ;
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:888:13: error: expected ';' before 'emergencyStop'
+  888 |     function emergencyStop() {
+      |             ^~~~~~~~~~~~~~
+      |             ;
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:893:3: error: expected primary-expression before '<' token
+  893 |   </script>
+      |   ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:893:4: error: expected primary-expression before '/' token
+  893 |   </script>
+      |    ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:893:5: error: 'script' was not declared in this scope
+  893 |   </script>
+      |     ^~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:894:1: error: expected primary-expression before '<' token
+  894 | </body>
+      | ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:894:2: error: expected primary-expression before '/' token
+  894 | </body>
+      |  ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:894:3: error: 'body' was not declared in this scope
+  894 | </body>
+      |   ^~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:895:1: error: expected primary-expression before '<' token
+  895 | </html>
+      | ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:895:2: error: expected primary-expression before '/' token
+  895 | </html>
+      |  ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:895:3: error: 'html' was not declared in this scope; did you mean 'mime::html'?
+  895 | </html>
+      |   ^~~~
+      |   mime::html
+In file included from C:\Users\AxelC\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WebServer\src/ESP8266WebServer.h:32,
+                 from C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:41:
+C:\Users\AxelC\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WebServer\src/detail/mimetable.h:11:3: note: 'mime::html' declared here
+   11 |   html,
+      |   ^~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:896:1: error: expected primary-expression before ')' token
+  896 | )rawliteral";
+      | ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:903:14: error: a function-definition is not allowed here before '{' token
+  903 | void setup() {
+      |              ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:981:13: error: a function-definition is not allowed here before '{' token
+  981 | void loop() {
+      |             ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:999:29: error: a function-definition is not allowed here before '{' token
+  999 | void testFlameRodDetailed() {
+      |                             ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1073:26: error: a function-definition is not allowed here before '{' token
+ 1073 | void calibrateFlameRod() {
+      |                          ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1173:27: error: a function-definition is not allowed here before '{' token
+ 1173 | void testFlameRodLevels() {
+      |                           ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1367:3: error: 'setFlameRodOutput' was not declared in this scope
+ 1367 |   setFlameRodOutput(false); // Turn off flame rod after calibration
+      |   ^~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1371:27: error: a function-definition is not allowed here before '{' token
+ 1371 | void testFlameRodLevels() {
+      |                           ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1566:3: error: 'setFlameRodOutput' was not declared in this scope
+ 1566 |   setFlameRodOutput(false); // Turn off flame rod after calibration
+      |   ^~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1570:27: error: a function-definition is not allowed here before '{' token
+ 1570 | void testFlameRodLevels() {
+      |                           ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1677:4: error: 'FlameWerks' was not declared in this scope
+ 1677 |  * FlameWerks Remote Burner Control System - SINGLE RELAY TEST VERSION
+      |    ^~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1778:32: error: a function-definition is not allowed here before '{' token
+ 1778 | void setPilotValve(bool state) {
+      |                                ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1785:31: error: a function-definition is not allowed here before '{' token
+ 1785 | void setMainValve(bool state) {
+      |                               ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1797:30: error: a function-definition is not allowed here before '{' token
+ 1797 | void setGlowPlug(bool state) {
+      |                              ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1804:26: error: a function-definition is not allowed here before '{' token
+ 1804 | void emergencyShutdown() {
+      |                          ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1812:24: error: a function-definition is not allowed here before '{' token
+ 1812 | bool readFlameStatus() {
+      |                        ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:1970:33: error: a function-definition is not allowed here before '{' token
+ 1970 | void updateBurnerStateMachine() {
+      |                                 ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2075:19: error: a function-definition is not allowed here before '{' token
+ 2075 | void handleRoot() {
+      |                   ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2081:21: error: a function-definition is not allowed here before '{' token
+ 2081 | void handleStatus() {
+      |                     ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2114:22: error: a function-definition is not allowed here before '{' token
+ 2114 | void handleControl() {
+      |                      ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2156:23: error: a function-definition is not allowed here before '{' token
+ 2156 | void handleNotFound() {
+      |                       ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2161:29: error: a function-definition is not allowed here before '{' token
+ 2161 | void handleSerialCommands() {
+      |                             ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2429:20: error: section attribute cannot be specified for local variables
+ 2429 | const char PROGMEM webUI[] = R"rawliteral(
+      |                    ^~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2574:19: error: a function-definition is not allowed here before '{' token
+ 2574 | String getWebUI() {
+      |                   ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2579:14: error: a function-definition is not allowed here before '{' token
+ 2579 | void setup() {
+      |              ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2657:13: error: a function-definition is not allowed here before '{' token
+ 2657 | void loop() {
+      |             ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2675:29: error: a function-definition is not allowed here before '{' token
+ 2675 | void testFlameRodDetailed() {
+      |                             ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2749:26: error: a function-definition is not allowed here before '{' token
+ 2749 | void calibrateFlameRod() {
+      |                          ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2851:13: error: a function-definition is not allowed here before '{' token
+ 2851 | void loop() {
+      |             ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2869:29: error: a function-definition is not allowed here before '{' token
+ 2869 | void testFlameRodDetailed() {
+      |                             ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:2943:26: error: a function-definition is not allowed here before '{' token
+ 2943 | void calibrateFlameRod() {
+      |                          ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:3046:27: error: a function-definition is not allowed here before '{' token
+ 3046 | void testFlameRodLevels() {
+      |                           ^
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:3241:3: error: 'setFlameRodOutput' was not declared in this scope
+ 3241 |   setFlameRodOutput(false); // Turn off flame rod after calibration
+      |   ^~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino: In function 'void testFlameRodLevels()':
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:3266:5: error: 'setFlameRodOutputLevel' was not declared in this scope
+ 3266 |     setFlameRodOutputLevel(levels[i]);
+      |     ^~~~~~~~~~~~~~~~~~~~~~
+C:\Users\AxelC\OneDrive\Desktop\AppFirmware8-5\AppFirmware8-5.ino:3347:3: error: 'setFlameRodOutputLevel' was not declared in this scope
+ 3347 |   setFlameRodOutputLevel(0);
+      |   ^~~~~~~~~~~~~~~~~~~~~~
+exit status 1
+
+Compilation error: empty character constant
+
+
+
