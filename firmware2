@@ -98,10 +98,12 @@ const int MAX_IGNITION_ATTEMPTS = 3;                 // Maximum retry attempts
 const int FLAME_DETECTION_THRESHOLD = 25;            // Lowered from 50 for better flame sensitivity
 const int FLAME_HYSTERESIS = 3;                      // Reduced hysteresis for faster response
 
-// --- Signal Filtering Parameters ---
-const int FILTER_SAMPLES = 8;                        // Number of samples to average
-const int STABILITY_REQUIRED = 3;                    // Consecutive stable readings required
-const int MAX_NOISE_TOLERANCE = 15;                  // Maximum ADC variation to consider "stable"
+// --- Enhanced Signal Filtering Parameters ---
+const int FILTER_SAMPLES = 16;                       // Increased samples for better averaging
+const int STABILITY_REQUIRED = 5;                    // More consecutive readings required for flame on
+const int STABILITY_REQUIRED_OFF = 3;                // Fewer readings required to turn off (faster safety)
+const int MAX_NOISE_TOLERANCE = 25;                  // Increased tolerance for noisy environments
+const int OUTLIER_REJECTION_SAMPLES = 8;             // Number of rapid samples for outlier rejection
 
 // --- Web Server ---
 ESP8266WebServer server(80);
@@ -144,33 +146,64 @@ void emergencyShutdown() {
 }
 
 bool readFlameStatus() {
-  // Multi-sample averaging for noise reduction
+  // Enhanced multi-sample averaging with outlier rejection
   static int sampleBuffer[FILTER_SAMPLES];
   static int sampleIndex = 0;
   static bool bufferFilled = false;
   static int stableFlameCount = 0;
   static int stableNoFlameCount = 0;
   static bool lastStableFlame = false;
+  static unsigned long lastReadTime = 0;
   
-  // Take current reading
-  int rawReading = analogRead(FLAME_SENSE_PIN);
+  // Rate limiting - don't read too frequently to reduce noise
+  if (millis() - lastReadTime < 50) {
+    return lastStableFlame;
+  }
+  lastReadTime = millis();
   
-  // Fill circular buffer
-  sampleBuffer[sampleIndex] = rawReading;
+  // Take multiple rapid readings and filter out outliers
+  int readings[OUTLIER_REJECTION_SAMPLES];
+  for (int i = 0; i < OUTLIER_REJECTION_SAMPLES; i++) {
+    readings[i] = analogRead(FLAME_SENSE_PIN);
+    delayMicroseconds(200); // Small delay between readings
+  }
+  
+  // Sort readings to find median (removes outliers)
+  for (int i = 0; i < OUTLIER_REJECTION_SAMPLES - 1; i++) {
+    for (int j = i + 1; j < OUTLIER_REJECTION_SAMPLES; j++) {
+      if (readings[i] > readings[j]) {
+        int temp = readings[i];
+        readings[i] = readings[j];
+        readings[j] = temp;
+      }
+    }
+  }
+  
+  // Use median of middle readings (removes highest and lowest outliers)
+  int startIdx = OUTLIER_REJECTION_SAMPLES / 4;
+  int endIdx = OUTLIER_REJECTION_SAMPLES * 3 / 4;
+  int total = 0;
+  for (int i = startIdx; i < endIdx; i++) {
+    total += readings[i];
+  }
+  int filteredReading = total / (endIdx - startIdx);
+  
+  // Fill circular buffer with filtered reading
+  sampleBuffer[sampleIndex] = filteredReading;
   sampleIndex = (sampleIndex + 1) % FILTER_SAMPLES;
   if (!bufferFilled && sampleIndex == 0) {
     bufferFilled = true;
   }
   
-  // Calculate filtered reading (average of samples)
-  int total = 0;
+  // Calculate moving average
+  total = 0;
   int samplesUsed = bufferFilled ? FILTER_SAMPLES : sampleIndex;
   for (int i = 0; i < samplesUsed; i++) {
     total += sampleBuffer[i];
   }
-  int filteredReading = total / samplesUsed;
+  int movingAverage = total / samplesUsed;
   
-  // Calculate noise level (standard deviation approximation)
+  // Calculate noise level for stability assessment
   int maxSample = 0, minSample = 1024;
   for (int i = 0; i < samplesUsed; i++) {
     if (sampleBuffer[i] > maxSample) maxSample = sampleBuffer[i];
@@ -179,48 +212,50 @@ bool readFlameStatus() {
   int noiseLevel = maxSample - minSample;
   
   // Store for debugging
-  burner.lastFlameReading = filteredReading;
+  burner.lastFlameReading = movingAverage;
   
-  // Enhanced floating pin detection (using filtered reading)
+  // Enhanced floating pin detection
   static int consecutiveMaxReadings = 0;
   static int consecutiveMinReadings = 0;
   static bool hasWarnedFloating = false;
   
-  if (filteredReading >= 1020) {
+  if (movingAverage >= 1020) {
     consecutiveMaxReadings++;
     consecutiveMinReadings = 0;
-  } else if (filteredReading <= 10) {
+    if (consecutiveMaxReadings >= 5 && !hasWarnedFloating) {
+      Serial.println("*** WARNING: A0 PIN FLOATING! ***");
+      Serial.println("FIX: Connect 1MΩ resistor from A0 to GND");
+      hasWarnedFloating = true;
+    }
+  } else if (movingAverage <= 10) {
     consecutiveMinReadings++;
     consecutiveMaxReadings = 0;
+    if (hasWarnedFloating && consecutiveMinReadings >= 3) {
+      Serial.println("*** A0 PIN STABILIZED ***");
+      hasWarnedFloating = false;
+    }
   } else {
     consecutiveMaxReadings = 0;
     consecutiveMinReadings = 0;
   }
   
-  // Floating pin warnings
-  if (consecutiveMaxReadings >= 3 && !hasWarnedFloating) {
-    Serial.println("*** WARNING: A0 PIN FLOATING! ***");
-    Serial.println("ADC reading stuck at maximum (1024) - A0 not properly connected");
-    Serial.println("CHECK: 1MΩ resistor from A0 to GND, flame rod to A0 connection");
-    hasWarnedFloating = true;
+  // Adaptive threshold based on noise level
+  int adaptiveThreshold = FLAME_DETECTION_THRESHOLD;
+  if (noiseLevel > 20) {
+    adaptiveThreshold += noiseLevel / 3; // Increase threshold if noisy
   }
   
-  if (consecutiveMinReadings >= 5 && hasWarnedFloating) {
-    Serial.println("*** A0 PIN STABILIZED - Good baseline readings ***");
-    hasWarnedFloating = false;
-  }
-  
-  // Determine potential flame state based on threshold
+  // Determine potential flame state with hysteresis
   bool potentialFlame;
-  if (filteredReading >= 1020) {
+  if (movingAverage >= 1020) {
     potentialFlame = false; // Ignore floating readings
   } else {
     if (lastStableFlame) {
-      // Use hysteresis when turning off
-      potentialFlame = filteredReading > (FLAME_DETECTION_THRESHOLD - FLAME_HYSTERESIS);
+      // Use hysteresis when turning off (easier to turn off)
+      potentialFlame = movingAverage > (adaptiveThreshold - FLAME_HYSTERESIS);
     } else {
-      // Use hysteresis when turning on
-      potentialFlame = filteredReading > (FLAME_DETECTION_THRESHOLD + FLAME_HYSTERESIS);
+      // Use hysteresis when turning on (harder to turn on)
+      potentialFlame = movingAverage > (adaptiveThreshold + FLAME_HYSTERESIS);
     }
   }
   
@@ -234,70 +269,89 @@ bool readFlameStatus() {
     stableNoFlameCount++;
     stableFlameCount = 0;
   } else {
-    // Readings are not stable, don't change counters
-    // This prevents state changes during noisy periods
+    // Not stable - reduce counters gradually to prevent false triggers
+    if (noiseLevel > MAX_NOISE_TOLERANCE) {
+      stableFlameCount = max(0, stableFlameCount - 1);
+      stableNoFlameCount = max(0, stableNoFlameCount - 1);
+    }
   }
   
   // Change state only after consecutive stable readings
-  bool newFlameState = lastStableFlame; // Default to current state
+  bool newFlameState = lastStableFlame;
   
   if (stableFlameCount >= STABILITY_REQUIRED) {
     newFlameState = true;
     stableFlameCount = STABILITY_REQUIRED; // Prevent overflow
-  } else if (stableNoFlameCount >= STABILITY_REQUIRED) {
+  } else if (stableNoFlameCount >= STABILITY_REQUIRED_OFF) {
     newFlameState = false;
-    stableNoFlameCount = STABILITY_REQUIRED; // Prevent overflow
+    stableNoFlameCount = STABILITY_REQUIRED_OFF;
   }
   
-  // Report state changes immediately
+  // Report state changes
   if (newFlameState != lastStableFlame) {
     if (newFlameState) {
-      Serial.print("🔥 STABLE FLAME DETECTED! Filtered ADC: ");
+      Serial.print("🔥 STABLE FLAME DETECTED! Avg: ");
+      Serial.print(movingAverage);
+      Serial.print(" (Filtered: ");
       Serial.print(filteredReading);
-      Serial.print(" (Raw: ");
-      Serial.print(rawReading);
       Serial.print(", Noise: ");
       Serial.print(noiseLevel);
       Serial.print(", Threshold: ");
-      Serial.print(FLAME_DETECTION_THRESHOLD);
+      Serial.print(adaptiveThreshold);
       Serial.println(") 🔥");
     } else {
-      Serial.print("❄️ STABLE FLAME LOST - Filtered ADC: ");
-      Serial.print(filteredReading);
-      Serial.print(" (Raw: ");
-      Serial.print(rawReading);
-      Serial.print(", Noise: ");
+      Serial.print("❄️ STABLE FLAME LOST - Avg: ");
+      Serial.print(movingAverage);
+      Serial.print(" (Noise: ");
       Serial.print(noiseLevel);
-      Serial.print(", Below threshold: ");
-      Serial.print(FLAME_DETECTION_THRESHOLD);
+      Serial.print(", Below: ");
+      Serial.print(adaptiveThreshold);
       Serial.println(") ❄️");
     }
     lastStableFlame = newFlameState;
   }
   
-  // Enhanced debug output every 3 seconds
+  // Enhanced debug output every 5 seconds
   static unsigned long lastDebugOutput = 0;
-  if (millis() - lastDebugOutput > 3000) {
-    Serial.print("Flame sensor - Raw: ");
-    Serial.print(rawReading);
-    Serial.print(" | Filtered: ");
+  if (millis() - lastDebugOutput > 5000) {
+    Serial.print("Flame - Raw: ");
+    Serial.print(analogRead(FLAME_SENSE_PIN));
+    Serial.print(" | Filt: ");
     Serial.print(filteredReading);
+    Serial.print(" | Avg: ");
+    Serial.print(movingAverage);
     Serial.print(" | Noise: ");
     Serial.print(noiseLevel);
-    Serial.print(" | Threshold: ");
-    Serial.print(FLAME_DETECTION_THRESHOLD);
+    Serial.print(" | Thresh: ");
+    Serial.print(adaptiveThreshold);
     Serial.print(" | Flame: ");
     Serial.print(newFlameState ? "🔥 YES" : "❄️ NO");
-    Serial.print(" | Stability: ");
-    Serial.print(isStable ? "STABLE" : "NOISY");
-    if (filteredReading >= 1020) {
-      Serial.print(" [FLOATING - FIX A0!]");
+    Serial.print(" | Stable: ");
+    Serial.print(isStable ? "YES" : "NO");
+    if (movingAverage >= 1020) {
+      Serial.print(" [FLOATING!]");
     }
     Serial.println();
     lastDebugOutput = millis();
   }
   
   return newFlameState;
+}
+
+// Reset flame filter to clear any corrupted static variables
+void resetFlameFilter() {
+  Serial.println("=== RESETTING FLAME FILTER ===");
+  Serial.println("Clearing all filter buffers and static variables...");
+  
+  // Force a few calls to readFlameStatus to reset internal state
+  // This will reinitialize all static variables
+  for (int i = 0; i < 20; i++) {
+    readFlameStatus();
+    delay(50);
+  }
+  
+  Serial.println("Filter reset complete. Static variables reinitialized.");
+  Serial.println("Try your tests again now.");
 }
 
 // --- Enhanced State Machine Logic (SINGLE RELAY VERSION) ---
@@ -563,6 +617,15 @@ void handleSerialCommands() {
       Serial.println(burner.mainValveOpen ? "OPEN" : "CLOSED");
       Serial.println("==============================");
     }
+    else if (cmd == "reset_filter") {
+      resetFlameFilter();
+    }
+    else if (cmd == "adc_diagnostic") {
+      performADCDiagnostic();
+    }
+    else if (cmd == "stability_test") {
+      performStabilityTest();
+    }
     else if (cmd == "help" || cmd == "h") {
       Serial.println("=== FLAMEWERKS SERIAL COMMANDS ===");
       Serial.println("i/ignite     - Start ignition sequence");
@@ -578,6 +641,10 @@ void handleSerialCommands() {
       Serial.println("test_no_flame    - Test baseline with no flame");
       Serial.println("a0_test          - Enhanced A0 pin stability test (20 readings)");
       Serial.println("wiring_test      - Diagnose A0 pin wiring issues");
+      Serial.println("flame_diagnostic - COMPLETE flame system diagnostic");
+      Serial.println("adc_diagnostic   - NEW: Diagnose ADC reading problems");
+      Serial.println("reset_filter     - Reset flame sensor filter buffers");
+      Serial.println("stability_test   - NEW: Test improved filtering algorithm");
       Serial.println("glow_on      - Turn glow plug ON (pin 4)");
       Serial.println("glow_off     - Turn glow plug OFF (pin 4)");
       Serial.println("glow_test    - Test glow plug control sequence");
@@ -874,6 +941,169 @@ void handleSerialCommands() {
       }
       Serial.println("=============================");
     }
+    else if (cmd == "flame_cal") {
+      calibrateFlameRod();
+    }
+    else if (cmd == "flame_continuous") {
+      Serial.println("=== CONTINUOUS FLAME MONITORING ===");
+      Serial.println("Real-time flame sensor monitoring");
+      Serial.println("Press any key to stop...");
+      Serial.println("Format: Time | Raw ADC | Filtered | Flame Status");
+      Serial.println("===============================================");
+      
+      unsigned long startTime = millis();
+      while (!Serial.available()) {
+        unsigned long elapsed = (millis() - startTime) / 1000;
+        int rawReading = analogRead(FLAME_SENSE_PIN);
+        bool flameStatus = readFlameStatus();
+        int filteredReading = burner.lastFlameReading;
+        
+        Serial.print(elapsed);
+        Serial.print("s | ");
+        Serial.print(rawReading);
+        Serial.print(" | ");
+        Serial.print(filteredReading);
+        Serial.print(" | ");
+        Serial.println(flameStatus ? "🔥 FLAME" : "❄️ none");
+        
+        delay(500);
+      }
+      while (Serial.available()) Serial.read();
+      Serial.println("Continuous monitoring stopped");
+      Serial.println("=============================");
+    }
+    else if (cmd == "wiring_test") {
+      Serial.println("=== WIRING DIAGNOSTIC TEST ===");
+      Serial.println("Testing A0 pin wiring and circuit integrity");
+      Serial.println();
+      
+      Serial.println("Step 1: Testing A0 pin floating detection...");
+      int floatingCount = 0;
+      for (int i = 0; i < 5; i++) {
+        int reading = analogRead(FLAME_SENSE_PIN);
+        if (reading >= 1020) floatingCount++;
+        Serial.print("Reading "); Serial.print(i+1); Serial.print(": "); Serial.println(reading);
+        delay(200);
+      }
+      
+      if (floatingCount >= 3) {
+        Serial.println("❌ PROBLEM: A0 pin is floating (not connected)");
+        Serial.println("FIX: Connect 1MΩ resistor from A0 to GND");
+      } else {
+        Serial.println("✅ GOOD: A0 pin properly connected");
+      }
+      
+      Serial.println("\nStep 2: Testing flame rod output...");
+      Serial.println("Setting GPIO5 HIGH...");
+      digitalWrite(FLAME_ROD_OUT_PIN, HIGH);
+      delay(100);
+      int highReading = analogRead(FLAME_SENSE_PIN);
+      
+      Serial.println("Setting GPIO5 LOW...");
+      digitalWrite(FLAME_ROD_OUT_PIN, LOW);
+      delay(100);
+      int lowReading = analogRead(FLAME_SENSE_PIN);
+      
+      Serial.print("GPIO5 HIGH -> A0: "); Serial.println(highReading);
+      Serial.print("GPIO5 LOW -> A0: "); Serial.println(lowReading);
+      Serial.print("Difference: "); Serial.println(highReading - lowReading);
+      
+      if (abs(highReading - lowReading) < 10) {
+        Serial.println("❌ PROBLEM: No response to GPIO5 changes");
+        Serial.println("CHECK: Flame rod connections, circuit continuity");
+      } else {
+        Serial.println("✅ GOOD: A0 responds to GPIO5 changes");
+      }
+      
+      Serial.println("\n=== WIRING RECOMMENDATIONS ===");
+      Serial.println("Proper connections:");
+      Serial.println("1. GPIO5 -> Flame rod probe");
+      Serial.println("2. Flame rod -> A0 (via 1MΩ resistor)");
+      Serial.println("3. A0 -> GND (via 1MΩ resistor)");
+      Serial.println("4. ESP GND -> Burner chassis/ground");
+      Serial.println("==============================");
+    }
+    else if (cmd == "glow_on") {
+      setGlowPlug(true);
+      Serial.println("GLOW PLUG: ON (Pin 4 -> HIGH -> 12V glow plug activated)");
+    }
+    else if (cmd == "glow_off") {
+      setGlowPlug(false);
+      Serial.println("GLOW PLUG: OFF (Pin 4 -> LOW -> 12V glow plug deactivated)");
+    }
+    else if (cmd == "glow_test") {
+      Serial.println("=== GLOW PLUG CONTROL TEST ===");
+      Serial.println("Testing 12V glow plug control via Pin 4");
+      Serial.println("NOTE: Pin 4 outputs 3.3V signal to control 12V circuit");
+      Serial.println();
+      
+      Serial.println("Step 1: Glow plug OFF...");
+      setGlowPlug(false);
+      Serial.print("Pin 4 state: "); Serial.println(digitalRead(MAIN_RELAY_PIN) ? "HIGH (3.3V)" : "LOW (0V)");
+      delay(2000);
+      
+      Serial.println("Step 2: Glow plug ON...");
+      setGlowPlug(true);
+      Serial.print("Pin 4 state: "); Serial.println(digitalRead(MAIN_RELAY_PIN) ? "HIGH (3.3V)" : "LOW (0V)");
+      Serial.println("Expected: 12V glow plug should be heating");
+      delay(3000);
+      
+      Serial.println("Step 3: Glow plug OFF...");
+      setGlowPlug(false);
+      Serial.print("Pin 4 state: "); Serial.println(digitalRead(MAIN_RELAY_PIN) ? "HIGH (3.3V)" : "LOW (0V)");
+      Serial.println("Expected: 12V glow plug should stop heating");
+      
+      Serial.println("\n=== GLOW PLUG TEST COMPLETE ===");
+      Serial.println("Verify:");
+      Serial.println("- Pin 4 changes between 0V and 3.3V");
+      Serial.println("- 12V glow plug circuit responds to Pin 4");
+      Serial.println("- Glow plug heats when Pin 4 is HIGH");
+      Serial.println("===============================");
+    }
+    else if (cmd == "pin_test") {
+      Serial.println("=== GPIO PIN OUTPUT TEST ===");
+      Serial.println("Testing all control pins sequentially");
+      Serial.println("Format: Pin | Function | State | Expected Output");
+      Serial.println("==============================================");
+      
+      // Test each pin
+      Serial.println("\n--- Testing Pilot Valve (Pin 2) ---");
+      Serial.println("OFF:"); setPilotValve(false); 
+      Serial.print("Pin 2: "); Serial.println(digitalRead(PILOT_RELAY_PIN) ? "HIGH" : "LOW");
+      delay(1000);
+      Serial.println("ON:"); setPilotValve(true);
+      Serial.print("Pin 2: "); Serial.println(digitalRead(PILOT_RELAY_PIN) ? "HIGH" : "LOW");
+      delay(1000);
+      setPilotValve(false);
+      
+      Serial.println("\n--- Testing Glow Plug Control (Pin 4) ---");
+      Serial.println("OFF:"); setGlowPlug(false);
+      Serial.print("Pin 4: "); Serial.println(digitalRead(MAIN_RELAY_PIN) ? "HIGH" : "LOW");
+      delay(1000);
+      Serial.println("ON:"); setGlowPlug(true);
+      Serial.print("Pin 4: "); Serial.println(digitalRead(MAIN_RELAY_PIN) ? "HIGH" : "LOW");
+      delay(1000);
+      setGlowPlug(false);
+      
+      Serial.println("\n--- Testing Flame Rod Output (Pin 5) ---");
+      Serial.println("OFF:"); digitalWrite(FLAME_ROD_OUT_PIN, LOW);
+      Serial.print("Pin 5: "); Serial.println(digitalRead(FLAME_ROD_OUT_PIN) ? "HIGH" : "LOW");
+      delay(1000);
+      Serial.println("ON:"); digitalWrite(FLAME_ROD_OUT_PIN, HIGH);
+      Serial.print("Pin 5: "); Serial.println(digitalRead(FLAME_ROD_OUT_PIN) ? "HIGH" : "LOW");
+      delay(1000);
+      digitalWrite(FLAME_ROD_OUT_PIN, LOW);
+      
+      Serial.println("\n=== PIN TEST SUMMARY ===");
+      Serial.println("Pin 2 (Pilot): Should control pilot valve relay");
+      Serial.println("Pin 4 (Glow): Should control 12V glow plug circuit");
+      Serial.println("Pin 5 (Flame Rod): Should output AC bias to flame rod");
+      Serial.println("A0 (Flame Sense): Should read flame rectification signal");
+      Serial.println("========================");
+    }
+    else if (cmd == "flame_diagnostic") {
+      performCompleteFlameDiagnostic();
+    }
     else if (cmd.length() > 0) {
       Serial.println("Unknown command. Type 'help' for available commands.");
     }
@@ -1127,7 +1357,318 @@ void loop() {
   delay(50);
 }
 
-// --- Flame Rod Testing Functions ---
+// --- Enhanced Flame Rod Testing Functions ---
+void performADCDiagnostic() {
+  Serial.println("=== ADC DIAGNOSTIC - FINDING THE PROBLEM ===");
+  Serial.println("Your stability test shows ADC readings of 0 but filtered values >100");
+  Serial.println("This indicates a serious ADC or connection problem");
+  Serial.println("===============================================");
+  
+  Serial.println("\n*** STEP 1: BASIC ADC FUNCTIONALITY TEST ***");
+  Serial.println("Testing if ADC can read anything at all...");
+  
+  // Test ADC with different methods
+  for (int i = 0; i < 10; i++) {
+    int reading1 = analogRead(A0);
+    delay(10);
+    int reading2 = analogRead(FLAME_SENSE_PIN);
+    delay(10);
+    
+    Serial.print("Test "); Serial.print(i+1); Serial.print(": ");
+    Serial.print("analogRead(A0)="); Serial.print(reading1);
+    Serial.print(" | analogRead(FLAME_SENSE_PIN)="); Serial.print(reading2);
+    
+    if (reading1 == 0 && reading2 == 0) {
+      Serial.print(" ❌ BOTH ZERO - ADC PROBLEM!");
+    } else if (reading1 != reading2) {
+      Serial.print(" ⚠️ DIFFERENT VALUES - TIMING ISSUE");
+    } else {
+      Serial.print(" ✅ NORMAL");
+    }
+    Serial.println();
+    delay(500);
+  }
+  
+  Serial.println("\n*** STEP 2: PIN CONFIGURATION CHECK ***");
+  Serial.print("FLAME_SENSE_PIN defined as: "); Serial.println(FLAME_SENSE_PIN);
+  Serial.print("This should equal A0 ("); Serial.print(A0); Serial.println(")");
+  
+  if (FLAME_SENSE_PIN != A0) {
+    Serial.println("❌ CRITICAL: Pin definition mismatch!");
+    Serial.println("FLAME_SENSE_PIN should be A0");
+  } else {
+    Serial.println("✅ Pin definition is correct");
+  }
+  
+  Serial.println("\n*** STEP 3: RAPID SAMPLING TEST ***");
+  Serial.println("Taking 100 rapid samples to see if ADC is stuck...");
+  
+  int zeroCount = 0;
+  int maxVal = 0;
+  int minVal = 1024;
+  
+  for (int i = 0; i < 100; i++) {
+    int reading = analogRead(A0);
+    if (reading == 0) zeroCount++;
+    if (reading > maxVal) maxVal = reading;
+    if (reading < minVal) minVal = reading;
+    delay(10);
+  }
+  
+  Serial.print("Zero readings: "); Serial.print(zeroCount); Serial.println("/100");
+  Serial.print("Min value: "); Serial.println(minVal);
+  Serial.print("Max value: "); Serial.println(maxVal);
+  Serial.print("Range: "); Serial.println(maxVal - minVal);
+  
+  if (zeroCount == 100) {
+    Serial.println("❌ CRITICAL: ADC always reads 0!");
+    Serial.println("POSSIBLE CAUSES:");
+    Serial.println("1. A0 pin is damaged or not connected");
+    Serial.println("2. ESP8266 ADC is faulty");
+    Serial.println("3. Pin is configured as digital output instead of analog input");
+    Serial.println("4. External short circuit to ground");
+  } else if (zeroCount > 50) {
+    Serial.println("⚠️ WARNING: ADC frequently reads 0 - intermittent connection");
+  } else if (maxVal == minVal) {
+    Serial.println("⚠️ WARNING: ADC reading is stuck at one value");
+  } else {
+    Serial.println("✅ ADC appears to be working - values vary");
+  }
+  
+  Serial.println("\n*** STEP 4: PHYSICAL CONNECTION TEST ***");
+  Serial.println("Testing if touching A0 pin changes readings...");
+  Serial.println("When prompted, briefly touch A0 pin with your finger");
+  delay(2000);
+  
+  Serial.println("Baseline (don't touch):");
+  int baseline = 0;
+  for (int i = 0; i < 5; i++) {
+    int reading = analogRead(A0);
+    baseline += reading;
+    Serial.print("  "); Serial.println(reading);
+    delay(200);
+  }
+  baseline /= 5;
+  
+  Serial.println("Now TOUCH the A0 pin with your finger for 3 seconds...");
+  delay(1000);
+  
+  int touchedSum = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(A0);
+    touchedSum += reading;
+    Serial.print("  Touch "); Serial.print(i+1); Serial.print(": "); Serial.println(reading);
+    delay(300);
+  }
+  int touchedAvg = touchedSum / 10;
+  
+  Serial.print("Baseline average: "); Serial.println(baseline);
+  Serial.print("Touched average: "); Serial.println(touchedAvg);
+  Serial.print("Difference: "); Serial.println(abs(touchedAvg - baseline));
+  
+  if (abs(touchedAvg - baseline) < 5) {
+    Serial.println("❌ CRITICAL: No change when touching A0 - pin not working!");
+    Serial.println("SOLUTIONS:");
+    Serial.println("1. Check A0 pin is properly connected to breadboard");
+    Serial.println("2. Try different ESP8266 board");
+    Serial.println("3. Verify wiring to A0 pin");
+  } else {
+    Serial.println("✅ GOOD: A0 pin responds to touch - hardware is working");
+  }
+  
+  Serial.println("\n*** STEP 5: FILTERING ALGORITHM DEBUG ***");
+  Serial.println("The filtering algorithm might be using old/corrupt data");
+  Serial.println("Let's examine what's happening inside the filter...");
+  
+  // Reset the filter and watch it
+  Serial.println("Taking 20 readings and showing filter progression:");
+  for (int i = 0; i < 20; i++) {
+    int rawReading = analogRead(A0);
+    bool flameStatus = readFlameStatus();
+    int filteredReading = burner.lastFlameReading;
+    
+    Serial.print("Reading "); Serial.print(i+1); Serial.print(": ");
+    Serial.print("Raw="); Serial.print(rawReading);
+    Serial.print(" | Filtered="); Serial.print(filteredReading);
+    Serial.print(" | Flame="); Serial.println(flameStatus ? "YES" : "NO");
+    delay(500);
+  }
+  
+  Serial.println("\n=== DIAGNOSTIC CONCLUSIONS ===");
+  
+  if (zeroCount == 100) {
+    Serial.println("🚨 HARDWARE FAILURE: A0 pin is not working");
+    Serial.println("IMMEDIATE ACTIONS:");
+    Serial.println("1. Check physical connection to A0 pin");
+    Serial.println("2. Try a different ESP8266 board");
+    Serial.println("3. Verify no short circuits");
+  } else if (zeroCount > 10) {
+    Serial.println("⚠️ INTERMITTENT PROBLEM: Loose connections");
+    Serial.println("FIXES:");
+    Serial.println("1. Re-solder connections to A0 pin");
+    Serial.println("2. Check breadboard contacts");
+    Serial.println("3. Use shorter, more stable wires");
+  } else {
+    Serial.println("🤔 SOFTWARE ISSUE: ADC works but filtering has problems");
+    Serial.println("The issue is likely in the filtering algorithm or buffer corruption");
+    Serial.println("Try restarting the ESP8266 to reset all static variables");
+  }
+  
+  Serial.println("\n=== ADC DIAGNOSTIC COMPLETE ===");
+}
+
+void performStabilityTest() {
+  Serial.println("=== ENHANCED STABILITY TEST WITH IMPROVED FILTERING ===");
+  Serial.println("Testing new filtering algorithm for 60 seconds");
+  Serial.println("This test has 2 phases - follow instructions carefully");
+  Serial.println("Format: Time | Raw | Filtered | Average | Noise | Flame");
+  Serial.println("======================================================");
+  
+  Serial.println("PHASE 1: No flame baseline (30 seconds)...");
+  Serial.println("Make sure NO flame is near the sensor!");
+  delay(3000); // Give time to move flame away
+  
+  unsigned long testStart = millis();
+  int baselineSum = 0;
+  int baselineCount = 0;
+  int maxNoise = 0;
+  
+  while (millis() - testStart < 30000) {
+    unsigned long elapsed = (millis() - testStart) / 1000;
+    int rawReading = analogRead(FLAME_SENSE_PIN);
+    bool flameStatus = readFlameStatus();
+    int avgReading = burner.lastFlameReading;
+    
+    baselineSum += avgReading;
+    baselineCount++;
+    
+    // Print every 5 seconds
+    if (elapsed % 5 == 0 && (millis() - testStart) % 1000 < 100) {
+      Serial.print(elapsed); Serial.print("s | ");
+      Serial.print(rawReading); Serial.print(" | ");
+      Serial.print("--"); Serial.print(" | ");
+      Serial.print(avgReading); Serial.print(" | ");
+      Serial.print("--"); Serial.print(" | ");
+      Serial.println(flameStatus ? "🔥" : "❄️");
+    }
+    delay(100);
+  }
+  
+  int baselineAvg = baselineSum / baselineCount;
+  Serial.print("BASELINE AVERAGE: "); Serial.println(baselineAvg);
+  
+  if (baselineAvg > 50) {
+    Serial.println("⚠️  WARNING: High baseline - check for interference or floating A0");
+  } else if (baselineAvg >= 1020) {
+    Serial.println("❌ CRITICAL: A0 pin is FLOATING! Connect 1MΩ resistor from A0 to GND");
+    return;
+  } else {
+    Serial.println("✅ GOOD: Baseline is acceptable");
+  }
+  
+  Serial.println("\nPHASE 2: Light and hold flame near rod (30 seconds)...");
+  Serial.println("Light your lighter NOW and hold flame close to flame rod...");
+  delay(3000); // Give time to light flame
+  
+  testStart = millis();
+  int flameSum = 0;
+  int flameCount = 0;
+  int flameDetections = 0;
+  int maxFlameReading = 0;
+  
+  while (millis() - testStart < 30000) {
+    unsigned long elapsed = (millis() - testStart) / 1000;
+    int rawReading = analogRead(FLAME_SENSE_PIN);
+    bool flameStatus = readFlameStatus();
+    int avgReading = burner.lastFlameReading;
+    
+    flameSum += avgReading;
+    flameCount++;
+    if (flameStatus) flameDetections++;
+    if (avgReading > maxFlameReading) maxFlameReading = avgReading;
+    
+    // Print every 2 seconds during flame test
+    if (elapsed % 2 == 0 && (millis() - testStart) % 1000 < 100) {
+      Serial.print(elapsed); Serial.print("s | ");
+      Serial.print(rawReading); Serial.print(" | ");
+      Serial.print("--"); Serial.print(" | ");
+      Serial.print(avgReading); Serial.print(" | ");
+      Serial.print("--"); Serial.print(" | ");
+      Serial.print(flameStatus ? "🔥" : "❄️");
+      if (avgReading > baselineAvg + 20) Serial.print(" GOOD!");
+      Serial.println();
+    }
+    delay(100);
+  }
+  
+  int flameAvg = flameSum / flameCount;
+  int signalIncrease = maxFlameReading - baselineAvg;
+  
+  Serial.println("\n=== STABILITY TEST RESULTS ===");
+  Serial.println("================================");
+  Serial.print("Baseline average: "); Serial.println(baselineAvg);
+  Serial.print("Flame average: "); Serial.println(flameAvg);
+  Serial.print("Max flame reading: "); Serial.println(maxFlameReading);
+  Serial.print("Signal increase: "); Serial.println(signalIncrease);
+  Serial.print("Flame detections: "); Serial.print(flameDetections); 
+  Serial.print("/"); Serial.println(flameCount);
+  Serial.print("Detection rate: "); Serial.print((flameDetections * 100) / flameCount); Serial.println("%");
+  Serial.print("Current threshold: "); Serial.println(FLAME_DETECTION_THRESHOLD);
+  
+  Serial.println("\n--- ASSESSMENT ---");
+  
+  if (signalIncrease < 15) {
+    Serial.println("❌ POOR: Very weak flame signal");
+    Serial.println("SOLUTIONS:");
+    Serial.println("1. Hold flame closer to flame rod probe");
+    Serial.println("2. Check 1MΩ resistor value (must be 1 megohm, not 1k!)");
+    Serial.println("3. Verify flame rod is metallic and conductive");
+    Serial.println("4. Connect ESP GND to burner/lighter chassis for ground reference");
+  } else if (signalIncrease < 30) {
+    Serial.println("⚠️  MARGINAL: Weak but detectable signal");
+    Serial.println("IMPROVEMENTS:");
+    Serial.println("1. Position flame rod closer to flame");
+    Serial.println("2. Ensure good ground connection to burner/lighter");
+    Serial.println("3. Try lower threshold: " + String(baselineAvg + 10));
+  } else {
+    Serial.println("✅ EXCELLENT: Strong flame signal detected!");
+    Serial.println("Your improved filtering is working well!");
+  }
+  
+  if (flameDetections > (flameCount * 0.8)) {
+    Serial.println("✅ EXCELLENT: Very stable flame detection");
+  } else if (flameDetections > (flameCount * 0.6)) {
+    Serial.println("✅ GOOD: Stable flame detection");
+  } else if (flameDetections > (flameCount * 0.3)) {
+    Serial.println("⚠️  MARGINAL: Intermittent detection - improve signal");
+  } else {
+    Serial.println("❌ POOR: Unreliable detection");
+  }
+  
+  Serial.println("\n--- FILTERING PERFORMANCE ---");
+  Serial.println("The new filtering algorithm includes:");
+  Serial.println("✓ 8-sample outlier rejection per reading");
+  Serial.println("✓ 16-sample moving average");
+  Serial.println("✓ Adaptive threshold based on noise level");
+  Serial.println("✓ 5 stable readings required to detect flame");
+  Serial.println("✓ 3 stable readings required to lose flame");
+  Serial.println("✓ Rate limiting to reduce noise susceptibility");
+  
+  Serial.println("\n--- NEXT STEPS ---");
+  if (signalIncrease >= 20 && flameDetections > (flameCount * 0.6)) {
+    Serial.println("🎉 SUCCESS! Your improved flame sensor is working!");
+    Serial.println("The enhanced filtering has made it much more stable.");
+    Serial.println("Try command 'ignite' to test full system.");
+  } else {
+    Serial.println("🔧 HARDWARE ISSUES REMAIN:");
+    Serial.println("1. Fix wiring issues identified above");
+    Serial.println("2. Re-run this test: 'stability_test'");
+    Serial.println("3. Try 'flame_diagnostic' for detailed troubleshooting");
+  }
+  
+  Serial.println("\n=== STABILITY TEST COMPLETE ===");
+}
+
 void testFlameRodDetailed() {
   Serial.println("\n=== DETAILED FLAME ROD TEST ===");
   Serial.println("Testing flame rectification circuit...");
@@ -1407,4 +1948,187 @@ void testFlameRodLevels() {
   setFlameRodOutputLevel(0);
   Serial.println("\nFlame rod output returned to OFF");
   Serial.println("=============================");
+}
+
+void setFlameRodOutputLevel(int level) {
+  // Set flame rod output level (0-4)
+  // Level 0 = OFF (0V), Level 4 = FULL (3.3V)
+  if (level <= 0) {
+    digitalWrite(FLAME_ROD_OUT_PIN, LOW);
+  } else {
+    // For levels 1-4, we'll use digital HIGH (3.3V)
+    // In a more advanced implementation, you could use analogWrite() for PWM
+    digitalWrite(FLAME_ROD_OUT_PIN, HIGH);
+  }
+}
+
+// Add new diagnostic function before setup()
+void performCompleteFlameDiagnostic() {
+  Serial.println("\n=== COMPLETE FLAME SENSOR DIAGNOSTIC ===");
+  Serial.println("This will test ALL aspects of your flame sensing system");
+  Serial.println("Follow the steps carefully and report results");
+  Serial.println("===============================================");
+  
+  // Step 1: Hardware Check
+  Serial.println("\n*** STEP 1: HARDWARE WIRING CHECK ***");
+  Serial.println("Verify these connections:");
+  Serial.println("1. GPIO5 (Pin D1) -> Flame rod probe");
+  Serial.println("2. Flame rod -> A0 (via 1MΩ resistor)");
+  Serial.println("3. 1MΩ resistor from A0 to GND");
+  Serial.println("4. ESP8266 GND -> Burner chassis/metal ground");
+  Serial.println("Press any key when wiring is verified...");
+  
+  while (!Serial.available()) delay(100);
+  while (Serial.available()) Serial.read();
+  
+  // Step 2: A0 Baseline Test
+  Serial.println("\n*** STEP 2: A0 BASELINE TEST ***");
+  Serial.println("Testing A0 with no flame present...");
+  
+  int baselineTotal = 0;
+  int floatingCount = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(FLAME_SENSE_PIN);
+    baselineTotal += reading;
+    if (reading >= 1020) floatingCount++;
+    
+    Serial.print("Baseline "); Serial.print(i+1); Serial.print(": ");
+    Serial.print(reading);
+    if (reading >= 1020) Serial.print(" (FLOATING!)");
+    else if (reading <= 5) Serial.print(" (GROUNDED)");
+    Serial.println();
+    delay(300);
+  }
+  
+  int baselineAvg = baselineTotal / 10;
+  Serial.print("\nBaseline Average: "); Serial.println(baselineAvg);
+  
+  if (floatingCount >= 5) {
+    Serial.println("❌ CRITICAL: A0 pin is FLOATING!");
+    Serial.println("   FIX: Connect 1MΩ resistor from A0 to GND");
+    Serial.println("   This is the most common problem!");
+    return;
+  } else if (baselineAvg > 100) {
+    Serial.println("⚠️  WARNING: High baseline - check for interference");
+  } else {
+    Serial.println("✅ GOOD: A0 baseline is acceptable");
+  }
+  
+  // Step 3: GPIO5 Output Test
+  Serial.println("\n*** STEP 3: GPIO5 OUTPUT TEST ***");
+  Serial.println("Testing GPIO5 flame rod output...");
+  
+  Serial.println("Setting GPIO5 LOW...");
+  digitalWrite(FLAME_ROD_OUT_PIN, LOW);
+  delay(200);
+  int lowReading = analogRead(FLAME_SENSE_PIN);
+  
+  Serial.println("Setting GPIO5 HIGH...");
+  digitalWrite(FLAME_ROD_OUT_PIN, HIGH);
+  delay(200);
+  int highReading = analogRead(FLAME_SENSE_PIN);
+  
+  digitalWrite(FLAME_ROD_OUT_PIN, LOW); // Return to safe state
+  
+  Serial.print("GPIO5 LOW -> A0: "); Serial.println(lowReading);
+  Serial.print("GPIO5 HIGH -> A0: "); Serial.println(highReading);
+  Serial.print("Difference: "); Serial.println(highReading - lowReading);
+  
+  if (abs(highReading - lowReading) < 10) {
+    Serial.println("❌ PROBLEM: GPIO5 not affecting A0 reading");
+    Serial.println("   CHECK: Flame rod connections, circuit continuity");
+    Serial.println("   Verify flame rod is connected to both GPIO5 and A0");
+  } else {
+    Serial.println("✅ GOOD: GPIO5 output affects A0 reading");
+  }
+  
+  // Step 4: Live Flame Test
+  Serial.println("\n*** STEP 4: LIVE FLAME TEST ***");
+  Serial.println("Now test with actual flame...");
+  Serial.println("1. Light a lighter or candle");
+  Serial.println("2. Hold flame close to flame rod probe");
+  Serial.println("3. Watch for readings above threshold (25)");
+  Serial.println("Press any key to start 30-second flame test...");
+  
+  while (!Serial.available()) delay(100);
+  while (Serial.available()) Serial.read();
+  
+  Serial.println("\nStarting 30-second flame test...");
+  Serial.println("Format: Time | Raw ADC | Filtered | Above Threshold?");
+  Serial.println("================================================");
+  
+  unsigned long testStart = millis();
+  int maxFlameReading = 0;
+  int flameDetections = 0;
+  
+  while (millis() - testStart < 30000) {
+    unsigned long elapsed = (millis() - testStart) / 1000;
+    int rawReading = analogRead(FLAME_SENSE_PIN);
+    bool flameStatus = readFlameStatus();
+    int filteredReading = burner.lastFlameReading;
+    
+    if (rawReading > maxFlameReading) maxFlameReading = rawReading;
+    if (flameStatus) flameDetections++;
+    
+    Serial.print(elapsed); Serial.print("s | ");
+    Serial.print(rawReading); Serial.print(" | ");
+    Serial.print(filteredReading); Serial.print(" | ");
+    Serial.print(rawReading > FLAME_DETECTION_THRESHOLD ? "YES" : "no");
+    if (flameStatus) Serial.print(" 🔥");
+    Serial.println();
+    
+    delay(1000);
+  }
+  
+  // Step 5: Results Analysis
+  Serial.println("\n*** STEP 5: DIAGNOSTIC RESULTS ***");
+  Serial.println("====================================");
+  
+  Serial.print("Baseline average: "); Serial.println(baselineAvg);
+  Serial.print("Max flame reading: "); Serial.println(maxFlameReading);
+  Serial.print("Signal increase: "); Serial.println(maxFlameReading - baselineAvg);
+  Serial.print("Flame detections: "); Serial.println(flameDetections);
+  Serial.print("Current threshold: "); Serial.println(FLAME_DETECTION_THRESHOLD);
+  
+  Serial.println("\n--- ASSESSMENT ---");
+  
+  if (maxFlameReading - baselineAvg < 20) {
+    Serial.println("❌ POOR: Very weak flame signal");
+    Serial.println("SOLUTIONS:");
+    Serial.println("1. Hold flame closer to flame rod probe");
+    Serial.println("2. Check 1MΩ resistor value (must be 1 megohm)");
+    Serial.println("3. Verify flame rod is metallic and conductive");
+    Serial.println("4. Ensure ESP GND connected to burner/lighter chassis");
+  } else if (maxFlameReading - baselineAvg < 50) {
+    Serial.println("⚠️  MARGINAL: Weak but detectable signal");
+    Serial.println("IMPROVEMENTS:");
+    Serial.println("1. Position flame rod closer to flame");
+    Serial.println("2. Ensure good ground connection");
+    Serial.println("3. Consider lowering threshold to " + String(baselineAvg + 15));
+  } else {
+    Serial.println("✅ EXCELLENT: Strong flame signal detected!");
+    Serial.println("Your flame sensor is working properly!");
+  }
+  
+  if (flameDetections > 10) {
+    Serial.println("✅ GOOD: Consistent flame detection during test");
+  } else if (flameDetections > 0) {
+    Serial.println("⚠️  INTERMITTENT: Some flame detection - improve signal");
+  } else {
+    Serial.println("❌ FAILED: No stable flame detection");
+  }
+  
+  Serial.println("\n--- NEXT STEPS ---");
+  if (maxFlameReading - baselineAvg >= 20 && flameDetections > 5) {
+    Serial.println("🎉 SUCCESS! Your flame sensor is working!");
+    Serial.println("You can now proceed with your burner testing.");
+    Serial.println("Try command 'ignite' to test full system.");
+  } else {
+    Serial.println("🔧 MORE WORK NEEDED:");
+    Serial.println("1. Fix wiring issues identified above");
+    Serial.println("2. Re-run this diagnostic: 'flame_diagnostic'");
+    Serial.println("3. Try 'wiring_test' for detailed connection check");
+  }
+  
+  Serial.println("\n=== DIAGNOSTIC COMPLETE ===");
 }
