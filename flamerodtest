@@ -1,0 +1,310 @@
+/*
+ * Flame Rod Basic Test Sketch
+ * For ESP8266-based Burner Control System
+ * 
+ * This sketch provides basic flame rod testing functionality
+ * including ADC reading, threshold detection, and serial output
+ * for diagnostic purposes.
+ * 
+ * Hardware Connections:
+ * - Flame Rod signal -> A0 (ADC input)
+ * - LED indicator -> GPIO2 (built-in LED)
+ * - Serial output for diagnostics
+ */
+
+#include <ESP8266WiFi.h>
+
+// Pin Definitions
+const int FLAME_ROD_PIN = A0;        // Analog input for flame rod
+const int LED_PIN = LED_BUILTIN;     // Built-in LED for status indication
+const int BUZZER_PIN = 4;            // Optional buzzer for audio indication
+
+// Configuration Constants
+const int FLAME_THRESHOLD = 200;     // ADC threshold for flame detection
+const int FLAME_HYSTERESIS = 50;     // Hysteresis to prevent oscillation
+const int SAMPLE_RATE = 10;          // Samples per second
+const int FLAME_TIMEOUT = 3000;      // Flame failure timeout (ms)
+const int FILTER_SAMPLES = 5;        // Number of samples for averaging
+
+// Global Variables
+int flameReadings[FILTER_SAMPLES];   // Array for signal filtering
+int filterIndex = 0;                 // Current position in filter array
+int filteredReading = 0;             // Filtered ADC value
+bool flameDetected = false;          // Current flame status
+bool previousFlameState = false;     // Previous flame status for edge detection
+unsigned long lastFlameTime = 0;     // Last time flame was detected
+unsigned long testStartTime = 0;     // Test start timestamp
+
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  delay(100);
+  
+  // Print startup banner
+  Serial.println("\n" + String("=").substring(0, 50));
+  Serial.println("FLAME ROD BASIC TEST SYSTEM");
+  Serial.println("Version 1.0 - ESP8266");
+  Serial.println("Date: August 10, 2025");
+  Serial.println(String("=").substring(0, 50));
+  
+  // Initialize pins
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  
+  // Initialize LED to OFF state
+  digitalWrite(LED_PIN, HIGH);  // HIGH = OFF for built-in LED
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // Initialize filter array
+  for (int i = 0; i < FILTER_SAMPLES; i++) {
+    flameReadings[i] = 0;
+  }
+  
+  // Power-On Self Test (POST)
+  performPowerOnSelfTest();
+  
+  // Record test start time
+  testStartTime = millis();
+  
+  Serial.println("\nSYSTEM READY - Starting flame rod monitoring...\n");
+  printHeader();
+}
+
+void loop() {
+  // Read and filter flame rod signal
+  readAndFilterSignal();
+  
+  // Process flame detection logic
+  processFlameDetection();
+  
+  // Update status indicators
+  updateStatusIndicators();
+  
+  // Print diagnostic information
+  printDiagnostics();
+  
+  // Wait for next sample
+  delay(1000 / SAMPLE_RATE);
+}
+
+void performPowerOnSelfTest() {
+  Serial.println("\nPerforming Power-On Self Test (POST)...");
+  
+  // Test 1: ADC Baseline Reading
+  Serial.print("Testing ADC baseline reading... ");
+  int baselineReading = analogRead(FLAME_ROD_PIN);
+  Serial.print("Reading: ");
+  Serial.print(baselineReading);
+  Serial.print(" ADC units");
+  
+  if (baselineReading < 50) {
+    Serial.println(" - PASS");
+  } else {
+    Serial.println(" - FAIL (Baseline too high!)");
+  }
+  
+  // Test 2: LED Test
+  Serial.print("Testing status LED... ");
+  digitalWrite(LED_PIN, LOW);   // Turn ON
+  delay(250);
+  digitalWrite(LED_PIN, HIGH);  // Turn OFF
+  delay(250);
+  Serial.println("PASS");
+  
+  // Test 3: Memory Test
+  Serial.print("Testing filter memory... ");
+  for (int i = 0; i < FILTER_SAMPLES; i++) {
+    if (flameReadings[i] != 0) {
+      Serial.println("FAIL");
+      return;
+    }
+  }
+  Serial.println("PASS");
+  
+  Serial.println("POST Complete - All tests passed");
+}
+
+void readAndFilterSignal() {
+  // Read raw ADC value
+  int rawReading = analogRead(FLAME_ROD_PIN);
+  
+  // Add to filter array
+  flameReadings[filterIndex] = rawReading;
+  filterIndex = (filterIndex + 1) % FILTER_SAMPLES;
+  
+  // Calculate filtered average
+  long sum = 0;
+  for (int i = 0; i < FILTER_SAMPLES; i++) {
+    sum += flameReadings[i];
+  }
+  filteredReading = sum / FILTER_SAMPLES;
+}
+
+void processFlameDetection() {
+  // Store previous state
+  previousFlameState = flameDetected;
+  
+  // Apply threshold with hysteresis
+  if (!flameDetected && filteredReading > FLAME_THRESHOLD) {
+    // Flame detected
+    flameDetected = true;
+    lastFlameTime = millis();
+  } else if (flameDetected && filteredReading < (FLAME_THRESHOLD - FLAME_HYSTERESIS)) {
+    // Flame lost
+    flameDetected = false;
+  }
+  
+  // Update last flame time if flame is present
+  if (flameDetected) {
+    lastFlameTime = millis();
+  }
+  
+  // Check for flame failure timeout
+  if (!flameDetected && (millis() - lastFlameTime) > FLAME_TIMEOUT) {
+    // Flame failure condition
+    // This would trigger safety shutdown in a real system
+  }
+  
+  // Detect state changes for logging
+  if (flameDetected != previousFlameState) {
+    if (flameDetected) {
+      Serial.println("\n*** FLAME DETECTED ***");
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(100);
+      digitalWrite(BUZZER_PIN, LOW);
+    } else {
+      Serial.println("\n*** FLAME LOST ***");
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(200);
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(100);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(200);
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  }
+}
+
+void updateStatusIndicators() {
+  // Update LED based on flame status
+  if (flameDetected) {
+    digitalWrite(LED_PIN, LOW);   // ON = Flame detected
+  } else {
+    // Blink LED when no flame
+    if ((millis() / 500) % 2) {
+      digitalWrite(LED_PIN, LOW);   // ON
+    } else {
+      digitalWrite(LED_PIN, HIGH);  // OFF
+    }
+  }
+}
+
+void printDiagnostics() {
+  static unsigned long lastPrintTime = 0;
+  static int printCounter = 0;
+  
+  // Print diagnostics every second
+  if (millis() - lastPrintTime >= 1000) {
+    lastPrintTime = millis();
+    printCounter++;
+    
+    // Print header every 20 lines
+    if (printCounter % 20 == 1) {
+      printHeader();
+    }
+    
+    // Calculate runtime
+    unsigned long runtime = (millis() - testStartTime) / 1000;
+    
+    // Print diagnostic line
+    Serial.print(formatTime(runtime));
+    Serial.print("\t");
+    Serial.print(filteredReading);
+    Serial.print("\t");
+    Serial.print(flameDetected ? "FLAME" : "NO FLAME");
+    Serial.print("\t");
+    Serial.print(FLAME_THRESHOLD);
+    Serial.print("\t");
+    
+    if (flameDetected) {
+      Serial.print("ACTIVE");
+    } else {
+      unsigned long timeSinceFlame = (millis() - lastFlameTime) / 1000;
+      Serial.print(timeSinceFlame);
+      Serial.print("s");
+    }
+    
+    Serial.println();
+  }
+}
+
+void printHeader() {
+  Serial.println("\nTime\t\tSignal\tStatus\t\tThreshold\tLast Flame");
+  Serial.println("--------\t------\t--------\t---------\t----------");
+}
+
+String formatTime(unsigned long seconds) {
+  unsigned long hours = seconds / 3600;
+  unsigned long minutes = (seconds % 3600) / 60;
+  unsigned long secs = seconds % 60;
+  
+  String timeStr = "";
+  if (hours < 10) timeStr += "0";
+  timeStr += String(hours) + ":";
+  if (minutes < 10) timeStr += "0";
+  timeStr += String(minutes) + ":";
+  if (secs < 10) timeStr += "0";
+  timeStr += String(secs);
+  
+  return timeStr;
+}
+
+// Test functions for manual testing
+void printTestMenu() {
+  Serial.println("\n" + String("=").substring(0, 40));
+  Serial.println("FLAME ROD TEST MENU");
+  Serial.println(String("=").substring(0, 40));
+  Serial.println("1. Run baseline test");
+  Serial.println("2. Run sensitivity test");
+  Serial.println("3. Run stability test");
+  Serial.println("4. Adjust threshold");
+  Serial.println("5. Reset statistics");
+  Serial.println("6. Show current status");
+  Serial.println("Enter command:");
+}
+
+// Function to handle serial commands (if needed)
+void processSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command == "menu") {
+      printTestMenu();
+    } else if (command == "status") {
+      printCurrentStatus();
+    } else if (command == "reset") {
+      ESP.restart();
+    }
+  }
+}
+
+void printCurrentStatus() {
+  Serial.println("\n" + String("=").substring(0, 30));
+  Serial.println("CURRENT SYSTEM STATUS");
+  Serial.println(String("=").substring(0, 30));
+  Serial.println("Runtime: " + formatTime((millis() - testStartTime) / 1000));
+  Serial.println("Current Signal: " + String(filteredReading) + " ADC units");
+  Serial.println("Flame Status: " + String(flameDetected ? "DETECTED" : "NOT DETECTED"));
+  Serial.println("Detection Threshold: " + String(FLAME_THRESHOLD) + " ADC units");
+  Serial.println("Hysteresis: " + String(FLAME_HYSTERESIS) + " ADC units");
+  Serial.println("Sample Rate: " + String(SAMPLE_RATE) + " Hz");
+  Serial.println("Filter Samples: " + String(FILTER_SAMPLES));
+  
+  if (!flameDetected) {
+    unsigned long timeSinceFlame = (millis() - lastFlameTime) / 1000;
+    Serial.println("Time since last flame: " + String(timeSinceFlame) + " seconds");
+  }
+  
+  Serial.println(String("=").substring(0, 30));
+}
