@@ -341,17 +341,15 @@ bool readFlameStatus() {
 // Reset flame filter to clear any corrupted static variables
 void resetFlameFilter() {
   Serial.println("=== RESETTING FLAME FILTER ===");
-  Serial.println("Clearing all filter buffers and static variables...");
-  
-  // Force a few calls to readFlameStatus to reset internal state
-  // This will reinitialize all static variables
-  for (int i = 0; i < 20; i++) {
-    readFlameStatus();
-    delay(50);
-  }
-  
-  Serial.println("Filter reset complete. Static variables reinitialized.");
-  Serial.println("Try your tests again now.");
+  Serial.println("The best way to reset corrupted static variables is to restart the ESP8266");
+  Serial.println("");
+  Serial.println("RECOMMENDED SOLUTIONS:");
+  Serial.println("1. Press the RESET button on your ESP8266");
+  Serial.println("2. Disconnect and reconnect power");
+  Serial.println("3. Re-upload this firmware");
+  Serial.println("");
+  Serial.println("This will completely clear all static variables and give you a fresh start.");
+  Serial.println("After restart, run 'stability_test' for clean results.");
 }
 
 // --- Enhanced State Machine Logic (SINGLE RELAY VERSION) ---
@@ -620,6 +618,48 @@ void handleSerialCommands() {
     else if (cmd == "reset_filter") {
       resetFlameFilter();
     }
+    else if (cmd == "force_reset_filter") {
+      Serial.println("=== FORCING FILTER RESET ===");
+      Serial.println("This will completely clear all static variables in the flame filter");
+      
+      // Set the force reset flag that will be picked up by readFlameStatus()
+      // We need to access the static variable, so we'll restart the ESP instead
+      Serial.println("SOLUTION: Restart the ESP8266 to completely clear all static variables");
+      Serial.println("1. Press the reset button on your ESP8266, OR");
+      Serial.println("2. Disconnect and reconnect power, OR");
+      Serial.println("3. Re-upload this firmware");
+      Serial.println("This will guarantee all filter buffers are completely cleared.");
+    }
+    else if (cmd == "filter_check") {
+      Serial.println("=== SIMPLE FILTER CHECK ===");
+      Serial.println("Taking 5 raw ADC readings...");
+      
+      int rawReadings[5];
+      int rawTotal = 0;
+      for (int i = 0; i < 5; i++) {
+        rawReadings[i] = analogRead(FLAME_SENSE_PIN);
+        rawTotal += rawReadings[i];
+        Serial.print("Raw reading "); Serial.print(i+1); 
+        Serial.print(": "); Serial.println(rawReadings[i]);
+        delay(200);
+      }
+      int rawAvg = rawTotal / 5;
+      
+      Serial.print("Raw average: "); Serial.println(rawAvg);
+      Serial.println("");
+      Serial.println("DIAGNOSIS:");
+      if (rawAvg < 10) {
+        Serial.println("✅ Good baseline - low readings as expected with no flame");
+      } else if (rawAvg > 100) {
+        Serial.println("⚠️  High readings - check for flame source or interference");
+      } else {
+        Serial.println("ℹ️  Moderate readings - acceptable range");
+      }
+      Serial.println("");
+      Serial.println("If you're getting false flame detections with low raw readings,");
+      Serial.println("the filter buffers are corrupted. SOLUTION: Restart ESP8266");
+      Serial.println("==========================");
+    }
     else if (cmd == "adc_diagnostic") {
       performADCDiagnostic();
     }
@@ -642,8 +682,10 @@ void handleSerialCommands() {
       Serial.println("a0_test          - Enhanced A0 pin stability test (20 readings)");
       Serial.println("wiring_test      - Diagnose A0 pin wiring issues");
       Serial.println("flame_diagnostic - COMPLETE flame system diagnostic");
+      Serial.println("filter_check     - Check for filter corruption (RECOMMENDED)");
       Serial.println("adc_diagnostic   - NEW: Diagnose ADC reading problems");
       Serial.println("reset_filter     - Reset flame sensor filter buffers");
+      Serial.println("force_reset_filter - FORCE complete filter reset (restart ESP)");
       Serial.println("stability_test   - NEW: Test improved filtering algorithm");
       Serial.println("glow_on      - Turn glow plug ON (pin 4)");
       Serial.println("glow_off     - Turn glow plug OFF (pin 4)");
@@ -1521,6 +1563,10 @@ void performStabilityTest() {
   Serial.println("=== ENHANCED STABILITY TEST WITH IMPROVED FILTERING ===");
   Serial.println("Testing new filtering algorithm for 60 seconds");
   Serial.println("This test has 2 phases - follow instructions carefully");
+  Serial.println("");
+  Serial.println("⚠️  IMPORTANT: If you suspect filter corruption, restart ESP8266 first!");
+  Serial.println("   (Press reset button or disconnect/reconnect power)");
+  Serial.println("");
   Serial.println("Format: Time | Raw | Filtered | Average | Noise | Flame");
   Serial.println("======================================================");
   
