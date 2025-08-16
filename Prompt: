@@ -1,0 +1,13 @@
+
+
+I am working on an ESP32-C6-based remote burner control system for farm use. The project is called "FlameWerks Remote Burner Control System" and uses WiFi for web-based control, QR code provisioning, and safety features. The hardware controls pilot and main gas valves, an igniter, and flame sensing via ADC. The code includes a web server, state machine, safety logic, and a PWA interface.
+
+What I need help with:
+
+Troubleshooting why my ESP32-C6 board is not connecting or uploading in Arduino IDE (it gets stuck at "Compiling sketch...").
+Reviewing my code for any issues that could prevent successful upload or operation.
+Suggestions for improving reliability, WiFi provisioning, or burner safety logic.
+Any advice for debugging ESP32-C6 hardware connectivity on Windows.
+My code is attached. Please provide step-by-step guidance and recommendations.
+
+
