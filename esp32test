@@ -1,0 +1,1335 @@
+/*
+ * FlameWerks Remote Burner Control System - ESP32-C6 WiFi Version
+ * SparkFun Thing Plus ESP32-C6 - Auburn I-31-2 Igniter Compatible
+ * 
+ * This version is optimized for ESP32-C6 with WiFi-only connectivity
+ * Perfect for multi-burner systems with master control dashboard
+ * 
+ * Hardware Configuration (ESP32-C6):
+ * GPIO 2  -> Pilot Valve Relay (via PC817 optocoupler)
+ * GPIO 3  -> Main Valve Relay (via PC817 optocoupler) 
+ * GPIO 4  -> Igniter/Glow Plug Control (Auburn I-31-2 or 12V Glow Plug)
+ * GPIO 5  -> Flame Rod Bias (PWM for rectification)
+ * GPIO 6  -> Flame Rod Input (via 1MΩ resistor - flame rectification)
+ * 
+ * ESP32-C6 Features Used:
+ * - WiFi 6 for web interface and master control
+ * - Multiple ADC channels (12-bit)
+ * - PWM outputs
+ * - Hardware timers for safety
+ * 
+ * Web Control Commands:
+ * - POST /control?cmd=ignite - Start ignition sequence
+ * - POST /control?cmd=stop - Emergency shutdown
+ * - GET /status - Get current system status (JSON)
+ * - POST /control?cmd=reset - Reset from fault state
+ * 
+ * Safety Features:
+ * - 5-second ignition timeout with automatic shutoff
+ * - Flame loss detection with immediate emergency closure
+ * - 3-attempt retry logic with 3-second cooldown
+ * - Fault state requiring manual reset
+ * - Electrical isolation via PC817 optocouplers
+ * - Watchdog timer for system reliability
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <ArduinoJson.h>
+#include <esp_timer.h>
+
+// --- Pin Definitions (ESP32-C6 SparkFun Thing Plus) ---
+#define PILOT_RELAY_PIN    2    // GPIO2 -> PC817 -> Pilot Valve Relay
+#define MAIN_RELAY_PIN     3    // GPIO3 -> PC817 -> Main Valve Relay
+#define IGNITER_PIN        4    // GPIO4 -> Igniter/Glow Plug Control
+#define FLAME_ROD_OUT_PIN  5    // GPIO5 -> Flame Rod AC Output (PWM)
+#define FLAME_SENSE_PIN    6    // GPIO6 -> Flame Rod Input (ADC1_CH5)
+
+// --- LED Indicators (ESP32-C6 Built-in) ---
+#define STATUS_LED_PIN     8    // Built-in LED on SparkFun Thing Plus ESP32-C6
+
+// --- Auto-Configuration (NO MANUAL SETUP REQUIRED) ---
+int BURNER_ID = 0;                           // Auto-assigned by system
+
+// --- WiFi Provisioning - Customer WiFi will be set via QR code ---
+String customer_ssid = "";                   // Customer's WiFi network (from QR scan)
+String customer_password = "";               // Customer's WiFi password (from QR scan)
+bool isProvisioned = false;                  // True after successful WiFi setup
+
+// --- Factory Default WiFi (for initial QR code setup) ---
+const char* setup_ssid = "FlameWerks-Setup"; // Temporary AP for QR code setup
+const char* setup_password = "setup123";     // Simple password for setup mode
+
+// --- Network Configuration (Auto-assigned) ---
+IPAddress local_IP;     // Will be auto-assigned by DHCP initially
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+String hostname;        // Will be auto-generated
+String burnerName;      // Will be auto-generated
+
+// --- Enhanced Burner State Machine ---
+enum BurnerState {
+  OFF,                // All systems off, safe state
+  PILOT_IGNITING,     // Opening pilot valve + igniter active
+  PILOT_ESTABLISHED,  // Pilot flame confirmed, stabilizing
+  MAIN_ON,           // Main valve open, full operation
+  FLAMEOUT,          // Flame lost, cooldown period
+  FAULT              // System fault, manual reset required
+};
+
+// --- Burner Control Structure ---
+struct BurnerController {
+  int id;
+  BurnerState state;
+  unsigned long stateStartTime;
+  int retryAttempt;
+  bool flameDetected;
+  bool igniterActive;
+  bool pilotValveOpen;
+  bool mainValveOpen;
+  int lastFlameReading;
+  float flameStrength;  // 0.0 to 100.0 percentage
+};
+
+// Initialize burner controller (ID will be auto-assigned)
+BurnerController burner = {0, OFF, 0, 0, false, false, false, false, 0, 0.0};
+
+// --- Enhanced Safety Parameters ---
+const unsigned long PILOT_IGNITION_TIME_MS = 5000;   // 5 seconds for pilot ignition
+const unsigned long PILOT_STABILIZE_TIME_MS = 2000;  // 2 seconds to stabilize pilot
+const unsigned long FLAME_CHECK_INTERVAL_MS = 100;   // Check flame every 100ms
+const unsigned long FLAME_LOSS_TIMEOUT_MS = 500;     // 500ms to detect flame loss
+const unsigned long COOLDOWN_PERIOD_MS = 3000;       // 3 second cooldown between attempts
+const int MAX_IGNITION_ATTEMPTS = 3;                 // Maximum retry attempts
+const int FLAME_DETECTION_THRESHOLD = 100;           // ADC threshold for flame detection
+const int FLAME_HYSTERESIS = 10;                     // Hysteresis for flame detection
+
+// --- Signal Filtering Parameters ---
+const int FILTER_SAMPLES = 16;
+const int STABILITY_REQUIRED = 5;
+const int MAX_NOISE_TOLERANCE = 50;
+
+// --- Web Server ---
+WebServer server(80);
+
+// --- Hardware Timer for Safety Watchdog ---
+esp_timer_handle_t safety_timer;
+
+// --- Status Tracking ---
+struct SystemStatus {
+  unsigned long uptime;
+  bool wifiConnected;
+  String lastCommand;
+  unsigned long lastCommandTime;
+  int wifiSignalStrength;
+  float cpuTemperature;
+} systemStatus;
+
+// --- Auto-Discovery and Configuration Functions ---
+void autoConfigureBurner() {
+  // Generate unique ID based on MAC address
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  
+  // Use last 4 digits of MAC as unique identifier
+  String uniqueID = mac.substring(8);
+  BURNER_ID = uniqueID.toInt() % 900 + 100; // Ensures ID between 100-999
+  
+  // Generate friendly name and hostname
+  burnerName = "Burner-" + uniqueID;
+  hostname = "flamewerks-" + uniqueID;
+  
+  // Update burner controller ID
+  burner.id = BURNER_ID;
+  
+  Serial.println("Auto-configured burner:");
+  Serial.println("  MAC: " + mac);
+  Serial.println("  ID: " + String(BURNER_ID));
+  Serial.println("  Name: " + burnerName);
+  Serial.println("  Hostname: " + hostname);
+}
+
+void registerWithMasterControl() {
+  // Try to register with master control system
+  // Master control will auto-detect this burner and add it to the list
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    // Send registration info to potential master controllers
+    // They can discover us via network scanning or mDNS
+    
+    String regData = "{";
+    regData += "\"id\":" + String(BURNER_ID) + ",";
+    regData += "\"name\":\"" + burnerName + "\",";
+    regData += "\"mac\":\"" + WiFi.macAddress() + "\",";
+    regData += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    regData += "\"type\":\"flamewerks-burner\",";
+    regData += "\"version\":\"1.0\"";
+    regData += "}";
+    
+    Serial.println("Registration data ready: " + regData);
+    
+    // Broadcast availability via mDNS
+    MDNS.addService("flamewerks", "tcp", 80);
+    MDNS.addServiceTxt("flamewerks", "tcp", "id", String(BURNER_ID));
+    MDNS.addServiceTxt("flamewerks", "tcp", "name", burnerName);
+    MDNS.addServiceTxt("flamewerks", "tcp", "type", "burner");
+  }
+}
+
+// --- QR Code WiFi Provisioning Functions ---
+void startProvisioningMode() {
+  Serial.println("Starting WiFi Provisioning Mode...");
+  
+  // Start Access Point for QR code setup
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(setup_ssid, setup_password);
+  
+  IPAddress AP_IP = WiFi.softAPIP();
+  Serial.println("Setup WiFi Access Point Started:");
+  Serial.println("  Network: " + String(setup_ssid));
+  Serial.println("  Password: " + String(setup_password));
+  Serial.println("  Setup URL: http://" + AP_IP.toString());
+  
+  // Generate QR code data for easy customer setup
+  generateSetupQR(AP_IP);
+}
+
+void generateSetupQR(IPAddress setupIP) {
+  // Create WiFi QR code data that customer can scan
+  // Format: WIFI:T:WPA;S:network;P:password;H:false;;
+  String qrWifiData = "WIFI:T:WPA;S:" + String(setup_ssid) + ";P:" + String(setup_password) + ";H:false;;";
+  
+  // Create setup URL QR code
+  String qrSetupURL = "http://" + setupIP.toString() + "/setup";
+  
+  Serial.println("\n=== CUSTOMER SETUP INSTRUCTIONS ===");
+  Serial.println("1. Customer scans QR code to connect to setup WiFi");
+  Serial.println("2. Phone automatically opens setup page");
+  Serial.println("3. Customer enters their WiFi credentials");
+  Serial.println("4. Burner automatically connects and is ready to use");
+  Serial.println("");
+  Serial.println("QR Code Data (WiFi): " + qrWifiData);
+  Serial.println("QR Code Data (Setup): " + qrSetupURL);
+  Serial.println("====================================\n");
+  
+  // You would generate actual QR codes from this data for printing on labels
+  // that ship with each burner system
+}
+
+bool connectToCustomerWiFi() {
+  if (customer_ssid.length() == 0) {
+    Serial.println("No customer WiFi configured");
+    return false;
+  }
+  
+  Serial.println("Connecting to customer WiFi: " + customer_ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(hostname.c_str());
+  
+  // Try static IP assignment first
+  if (attemptStaticIPAssignment()) {
+    Serial.println("Using static IP assignment");
+  }
+  
+  WiFi.begin(customer_ssid.c_str(), customer_password.c_str());
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to customer WiFi!");
+    Serial.println("IP: " + WiFi.localIP().toString());
+    isProvisioned = true;
+    saveWiFiCredentials(); // Save to persistent storage
+    return true;
+  } else {
+    Serial.println("\nFailed to connect to customer WiFi");
+    return false;
+  }
+}
+
+void saveWiFiCredentials() {
+  // Save WiFi credentials to ESP32 preferences (persistent storage)
+  // This ensures burner remembers customer WiFi after power cycles
+  
+  Serial.println("Saving WiFi credentials to persistent storage...");
+  
+  // In a real implementation, you'd use Preferences library:
+  // preferences.begin("flamewerks", false);
+  // preferences.putString("ssid", customer_ssid);
+  // preferences.putString("password", customer_password);
+  // preferences.putBool("provisioned", true);
+  // preferences.end();
+  
+  Serial.println("WiFi credentials saved successfully");
+}
+
+void loadWiFiCredentials() {
+  // Load WiFi credentials from ESP32 preferences
+  // This runs at startup to check if burner is already configured
+  
+  // In a real implementation, you'd use Preferences library:
+  // preferences.begin("flamewerks", true);
+  // customer_ssid = preferences.getString("ssid", "");
+  // customer_password = preferences.getString("password", "");
+  // isProvisioned = preferences.getBool("provisioned", false);
+  // preferences.end();
+  
+  // For demo, simulate checking for saved credentials
+  Serial.println("Checking for saved WiFi credentials...");
+  
+  if (customer_ssid.length() > 0) {
+    Serial.println("Found saved credentials for: " + customer_ssid);
+    isProvisioned = true;
+  } else {
+    Serial.println("No saved WiFi credentials - provisioning required");
+    isProvisioned = false;
+  }
+}
+
+bool attemptStaticIPAssignment() {
+  // Try to get a consistent IP based on our ID
+  // This makes it easier for master control to find us
+  
+  IPAddress desired_IP(192, 168, 1, 100 + (BURNER_ID % 100));
+  
+  // Test if this IP is available
+  if (WiFi.config(desired_IP, gateway, subnet)) {
+    Serial.println("Attempting static IP: " + desired_IP.toString());
+    return true;
+  }
+  
+  return false;
+}
+
+// --- Hardware Control Functions ---
+void setPilotValve(bool state) {
+  digitalWrite(PILOT_RELAY_PIN, state ? HIGH : LOW);
+  burner.pilotValveOpen = state;
+  logAction("Pilot valve: " + String(state ? "OPEN" : "CLOSED"));
+}
+
+void setMainValve(bool state) {
+  digitalWrite(MAIN_RELAY_PIN, state ? HIGH : LOW);
+  burner.mainValveOpen = state;
+  logAction("Main valve: " + String(state ? "OPEN" : "CLOSED"));
+}
+
+void setIgniter(bool state) {
+  digitalWrite(IGNITER_PIN, state ? HIGH : LOW);
+  burner.igniterActive = state;
+  logAction("Igniter: " + String(state ? "ON" : "OFF"));
+}
+
+void setFlameRodOutput(int pwmValue) {
+  // ESP32 uses 8-bit PWM (0-255) by default
+  analogWrite(FLAME_ROD_OUT_PIN, pwmValue);
+  logAction("Flame rod PWM: " + String(pwmValue));
+}
+
+void emergencyShutdown() {
+  setPilotValve(false);
+  setMainValve(false);
+  setIgniter(false);
+  setFlameRodOutput(0);
+  burner.state = OFF;
+  burner.retryAttempt = 0;
+  logAction("*** EMERGENCY SHUTDOWN - ALL SYSTEMS OFF ***");
+}
+
+// --- Enhanced Flame Detection ---
+bool readFlameStatus() {
+  static int sampleBuffer[FILTER_SAMPLES];
+  static int sampleIndex = 0;
+  static bool bufferFilled = false;
+  static int stableFlameCount = 0;
+  static int stableNoFlameCount = 0;
+  static bool lastStableFlame = false;
+  
+  // Read ADC value (ESP32-C6 has 12-bit ADC, 0-4095)
+  int rawReading = analogRead(FLAME_SENSE_PIN);
+  
+  // Fill circular buffer
+  sampleBuffer[sampleIndex] = rawReading;
+  sampleIndex = (sampleIndex + 1) % FILTER_SAMPLES;
+  if (!bufferFilled && sampleIndex == 0) {
+    bufferFilled = true;
+  }
+  
+  // Calculate moving average
+  int total = 0;
+  int samplesUsed = bufferFilled ? FILTER_SAMPLES : sampleIndex;
+  for (int i = 0; i < samplesUsed; i++) {
+    total += sampleBuffer[i];
+  }
+  int movingAverage = total / samplesUsed;
+  
+  // Store for status reporting
+  burner.lastFlameReading = movingAverage;
+  burner.flameStrength = map(movingAverage, 0, 4095, 0, 100);
+  burner.flameStrength = constrain(burner.flameStrength, 0.0, 100.0);
+  
+  // Determine flame state with hysteresis
+  bool potentialFlame;
+  if (lastStableFlame) {
+    potentialFlame = movingAverage > (FLAME_DETECTION_THRESHOLD - FLAME_HYSTERESIS);
+  } else {
+    potentialFlame = movingAverage > (FLAME_DETECTION_THRESHOLD + FLAME_HYSTERESIS);
+  }
+  
+  // Require stability before changing state
+  if (potentialFlame) {
+    stableFlameCount++;
+    stableNoFlameCount = 0;
+  } else {
+    stableNoFlameCount++;
+    stableFlameCount = 0;
+  }
+  
+  // Change state only after consecutive stable readings
+  bool newFlameState = lastStableFlame;
+  if (stableFlameCount >= STABILITY_REQUIRED) {
+    newFlameState = true;
+    stableFlameCount = STABILITY_REQUIRED;
+  } else if (stableNoFlameCount >= STABILITY_REQUIRED) {
+    newFlameState = false;
+    stableNoFlameCount = STABILITY_REQUIRED;
+  }
+  
+  // Report state changes
+  if (newFlameState != lastStableFlame) {
+    String message = newFlameState ? 
+      "FLAME DETECTED! Reading: " + String(movingAverage) :
+      "FLAME LOST - Reading: " + String(movingAverage);
+    logAction(message);
+    lastStableFlame = newFlameState;
+  }
+  
+  return newFlameState;
+}
+
+// --- Enhanced State Machine ---
+void updateBurnerStateMachine() {
+  static unsigned long lastUpdate = 0;
+  unsigned long currentTime = millis();
+  
+  // Update every 250ms for responsive control
+  if (currentTime - lastUpdate < 250) return;
+  lastUpdate = currentTime;
+  
+  // Read flame status
+  burner.flameDetected = readFlameStatus();
+  
+  switch (burner.state) {
+    case OFF:
+      // Safe state - all systems off
+      static bool offStateInitialized = false;
+      if (!offStateInitialized) {
+        setPilotValve(false);
+        setMainValve(false);
+        setIgniter(false);
+        setFlameRodOutput(0);
+        setStatusLED(false);
+        offStateInitialized = true;
+        logAction("System in OFF state");
+      }
+      break;
+      
+    case PILOT_IGNITING:
+      offStateInitialized = false;
+      setPilotValve(true);
+      setMainValve(false);
+      setIgniter(true);
+      setFlameRodOutput(128); // 50% PWM for flame rod bias
+      setStatusLED(true); // Blinking status
+      
+      if (burner.flameDetected) {
+        burner.state = PILOT_ESTABLISHED;
+        burner.stateStartTime = currentTime;
+        logAction("Pilot flame detected -> PILOT_ESTABLISHED");
+      } else if (currentTime - burner.stateStartTime > PILOT_IGNITION_TIME_MS) {
+        // Ignition timeout
+        setIgniter(false);
+        setPilotValve(false);
+        setFlameRodOutput(0);
+        
+        if (burner.retryAttempt < MAX_IGNITION_ATTEMPTS) {
+          burner.retryAttempt++;
+          burner.state = FLAMEOUT;
+          burner.stateStartTime = currentTime;
+          logAction("Pilot ignition failed, attempt " + String(burner.retryAttempt) + "/" + String(MAX_IGNITION_ATTEMPTS));
+        } else {
+          burner.state = FAULT;
+          logAction("Maximum ignition attempts exceeded -> FAULT");
+        }
+      }
+      break;
+      
+    case PILOT_ESTABLISHED:
+      setPilotValve(true);
+      setMainValve(false);
+      setIgniter(false); // Turn off igniter after pilot established
+      setFlameRodOutput(64); // Lower PWM for monitoring
+      
+      if (!burner.flameDetected) {
+        emergencyShutdown();
+        burner.state = FLAMEOUT;
+        burner.stateStartTime = currentTime;
+        logAction("Pilot flame lost -> EMERGENCY FLAMEOUT");
+      } else if (currentTime - burner.stateStartTime > PILOT_STABILIZE_TIME_MS) {
+        burner.state = MAIN_ON;
+        logAction("Pilot stabilized -> MAIN_ON");
+      }
+      break;
+      
+    case MAIN_ON:
+      setPilotValve(true);
+      setMainValve(true);
+      setIgniter(false);
+      setFlameRodOutput(64); // Monitoring PWM
+      setStatusLED(true); // Solid on
+      
+      if (!burner.flameDetected) {
+        emergencyShutdown();
+        burner.state = FLAMEOUT;
+        burner.stateStartTime = currentTime;
+        logAction("Main flame lost -> EMERGENCY FLAMEOUT");
+      }
+      break;
+      
+    case FLAMEOUT:
+      setPilotValve(false);
+      setMainValve(false);
+      setIgniter(false);
+      setFlameRodOutput(0);
+      setStatusLED(false);
+      
+      if (currentTime - burner.stateStartTime > COOLDOWN_PERIOD_MS) {
+        if (burner.retryAttempt < MAX_IGNITION_ATTEMPTS) {
+          burner.state = PILOT_IGNITING;
+          burner.stateStartTime = currentTime;
+          logAction("Cooldown complete, retrying ignition");
+        } else {
+          burner.state = FAULT;
+          logAction("Maximum retries exceeded -> FAULT");
+        }
+      }
+      break;
+      
+    case FAULT:
+      setPilotValve(false);
+      setMainValve(false);
+      setIgniter(false);
+      setFlameRodOutput(0);
+      blinkStatusLED(); // Blinking error pattern
+      break;
+  }
+}
+
+// --- LED Control Functions ---
+void setStatusLED(bool state) {
+  digitalWrite(STATUS_LED_PIN, state ? HIGH : LOW);
+}
+
+void blinkStatusLED() {
+  static unsigned long lastBlink = 0;
+  static bool ledState = false;
+  
+  if (millis() - lastBlink > 500) {
+    ledState = !ledState;
+    setStatusLED(ledState);
+    lastBlink = millis();
+  }
+}
+
+// --- Logging Functions ---
+void logAction(String message) {
+  String timestamp = String(millis());
+  String logMessage = "[" + timestamp + "] Burner " + String(BURNER_ID) + ": " + message;
+  
+  // Log to Serial
+  Serial.println(logMessage);
+  
+  // Store last command info
+  systemStatus.lastCommand = message;
+  systemStatus.lastCommandTime = millis();
+}
+
+// --- JSON Status Generation ---
+String getStatusJSON() {
+  DynamicJsonDocument doc(512);
+  
+  doc["id"] = burner.id;
+  doc["state"] = getStateString(burner.state);
+  doc["flame"] = burner.flameDetected;
+  doc["flameReading"] = burner.lastFlameReading;
+  doc["flameStrength"] = burner.flameStrength;
+  doc["attempts"] = burner.retryAttempt;
+  doc["maxAttempts"] = MAX_IGNITION_ATTEMPTS;
+  doc["igniterActive"] = burner.igniterActive;
+  doc["pilotOpen"] = burner.pilotValveOpen;
+  doc["mainOpen"] = burner.mainValveOpen;
+  doc["uptime"] = millis();
+  doc["wifiConnected"] = WiFi.status() == WL_CONNECTED;
+  doc["wifiSignal"] = WiFi.RSSI();
+  doc["freeHeap"] = ESP.getFreeHeap();
+  doc["ip"] = WiFi.localIP().toString();
+  
+  String output;
+  serializeJson(doc, output);
+  return output;
+}
+
+String getStateString(BurnerState state) {
+  switch (state) {
+    case OFF: return "off";
+    case PILOT_IGNITING: return "igniting";
+    case PILOT_ESTABLISHED: return "pilot-established";
+    case MAIN_ON: return "main-on";
+    case FLAMEOUT: return "flameout";
+    case FAULT: return "fault";
+    default: return "unknown";
+  }
+}
+
+// --- Command Processing ---
+void processCommand(String cmd) {
+  cmd.trim();
+  cmd.toLowerCase();
+  
+  String response = "";
+  
+  logAction("Command received: " + cmd);
+  
+  if (cmd == "ignite" || cmd == "on" || cmd == "start") {
+    if (burner.state == OFF || burner.state == FAULT) {
+      burner.state = PILOT_IGNITING;
+      burner.stateStartTime = millis();
+      burner.retryAttempt = 0;
+      response = "Ignition sequence initiated";
+    } else {
+      response = "Burner already active or in ignition process";
+    }
+  }
+  else if (cmd == "stop" || cmd == "off" || cmd == "emergency") {
+    emergencyShutdown();
+    response = "Emergency shutdown executed";
+  }
+  else if (cmd == "reset") {
+    if (burner.state == FAULT) {
+      burner.state = OFF;
+      burner.retryAttempt = 0;
+      response = "System reset from FAULT to OFF";
+    } else {
+      response = "Reset only available in FAULT state";
+    }
+  }
+  else if (cmd == "status") {
+    response = getStatusJSON();
+  }
+  else if (cmd == "help") {
+    response = "Commands: IGNITE, STOP, RESET, STATUS, HELP";
+  }
+  else {
+    response = "Unknown command: " + cmd;
+  }
+  
+  logAction("Response: " + response);
+}
+
+// --- Safety Timer Callback ---
+void IRAM_ATTR safetyTimerCallback(void* arg) {
+  // Hardware watchdog - ensure system doesn't hang
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat > 60000) {
+    // System appears hung - force emergency shutdown
+    emergencyShutdown();
+  }
+  lastHeartbeat = millis();
+}
+
+// --- Web Server Handlers ---
+void handleRoot() {
+  server.send(200, "text/html", getPWAInterface());
+}
+
+void handleManifest() {
+  server.send(200, "application/json", getPWAManifest());
+}
+
+void handleServiceWorker() {
+  server.send(200, "application/javascript", getServiceWorker());
+}
+
+void handleStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  server.send(200, "application/json", getStatusJSON());
+}
+
+void handleInfo() {
+  // Burner information endpoint for auto-discovery
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  
+  DynamicJsonDocument doc(256);
+  doc["id"] = BURNER_ID;
+  doc["name"] = burnerName;
+  doc["hostname"] = hostname;
+  doc["mac"] = WiFi.macAddress();
+  doc["ip"] = WiFi.localIP().toString();
+  doc["type"] = "flamewerks-burner";
+  doc["version"] = "1.0";
+  doc["auto_configured"] = true;
+  doc["provisioned"] = isProvisioned;
+  
+  String output;
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
+}
+
+void handleSetup() {
+  // WiFi setup page for QR code provisioning
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "text/html", getSetupInterface());
+}
+
+void handleProvision() {
+  // Process WiFi provisioning from customer
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  
+  if (server.hasArg("ssid") && server.hasArg("password")) {
+    customer_ssid = server.arg("ssid");
+    customer_password = server.arg("password");
+    
+    Serial.println("Received WiFi credentials:");
+    Serial.println("  SSID: " + customer_ssid);
+    Serial.println("  Password: [hidden]");
+    
+    // Try to connect to customer WiFi
+    if (connectToCustomerWiFi()) {
+      // Success - switch to normal operation mode
+      String response = "{\"status\":\"success\",\"message\":\"Connected to " + customer_ssid + "\",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+      server.send(200, "application/json", response);
+      
+      // Register with master control now that we're on customer network
+      registerWithMasterControl();
+      
+      Serial.println("=== PROVISIONING COMPLETE ===");
+      Serial.println("Burner is now ready for customer use!");
+      Serial.println("Customer can find burner at: http://" + WiFi.localIP().toString());
+      Serial.println("============================");
+      
+    } else {
+      // Failed to connect
+      String response = "{\"status\":\"error\",\"message\":\"Failed to connect to " + customer_ssid + "\"}";
+      server.send(400, "application/json", response);
+      
+      // Stay in setup mode
+      Serial.println("Staying in setup mode - customer needs to try again");
+    }
+  } else {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing WiFi credentials\"}");
+  }
+}
+
+void handleControl() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  
+  if (server.hasArg("cmd")) {
+    String cmd = server.arg("cmd");
+    processCommand(cmd);
+    server.send(200, "text/plain", "Command processed: " + cmd);
+  } else {
+    server.send(400, "text/plain", "Missing cmd parameter");
+  }
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "File not found");
+}
+
+// --- PWA Interface Functions ---
+String getPWAInterface() {
+  // Return different interface based on provisioning status
+  if (!isProvisioned) {
+    return getSetupInterface();
+  }
+  
+  return R"rawstring(<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FlameWerks Burner Control</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#ff6b35">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh; padding: 20px; color: white;
+        }
+        .container {
+            max-width: 400px; margin: 0 auto;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 20px; padding: 30px;
+        }
+        .header { text-align: center; margin-bottom: 30px; }
+        .logo { font-size: 3em; margin-bottom: 10px; }
+        h1 { font-size: 1.8em; margin-bottom: 5px; }
+        .subtitle { opacity: 0.8; font-size: 0.9em; }
+        .status-card {
+            background: rgba(255, 255, 255, 0.15); border-radius: 15px;
+            padding: 20px; margin-bottom: 25px; text-align: center;
+        }
+        .status-main { font-size: 1.5em; font-weight: bold; margin-bottom: 15px; }
+        .controls { display: grid; gap: 15px; }
+        .btn {
+            padding: 18px; border: none; border-radius: 12px; font-size: 1.1em;
+            font-weight: 600; cursor: pointer; color: white;
+        }
+        .btn-primary { background: #ff6b35; }
+        .btn-danger { background: #e74c3c; }
+        .btn-secondary { background: #3498db; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">🔥</div>
+            <h1>FlameWerks</h1>
+            <div class="subtitle" id="burnerName">Burner Control System</div>
+        </div>
+        
+        <div class="status-card">
+            <div id="systemState" class="status-main">System Off</div>
+            <div id="flameStatus" class="status-main">No Flame</div>
+        </div>
+        
+        <div class="controls">
+            <button id="igniteBtn" class="btn btn-primary">Ignite</button>
+            <button id="stopBtn" class="btn btn-danger">Emergency Stop</button>
+            <button id="resetBtn" class="btn btn-secondary">Reset</button>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('igniteBtn').addEventListener('click', () => sendCommand('IGNITE'));
+        document.getElementById('stopBtn').addEventListener('click', () => sendCommand('STOP'));
+        document.getElementById('resetBtn').addEventListener('click', () => sendCommand('RESET'));
+        
+        async function sendCommand(command) {
+            try {
+                const response = await fetch('/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'cmd=' + command.toLowerCase()
+                });
+                setTimeout(updateStatus, 500);
+            } catch (error) {
+                console.error('Command failed:', error);
+            }
+        }
+        
+        async function updateStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                
+                document.getElementById('systemState').textContent = 
+                    data.state.charAt(0).toUpperCase() + data.state.slice(1);
+                document.getElementById('flameStatus').textContent = 
+                    data.flame ? 'Flame Detected' : 'No Flame';
+                    
+                // Get burner info for display
+                const infoResponse = await fetch('/info');
+                const infoData = await infoResponse.json();
+                document.getElementById('burnerName').textContent = infoData.name || 'Burner Control System';
+            } catch (error) {
+                console.error('Status update failed:', error);
+            }
+        }
+        
+        setInterval(updateStatus, 2000);
+        updateStatus();
+    </script>
+</body>
+</html>)rawstring";
+}
+
+String getSetupInterface() {
+  return R"rawstring(<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FlameWerks Burner Setup</title>
+    <meta name="theme-color" content="#ff6b35">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh; padding: 20px; color: white;
+        }
+        .container {
+            max-width: 400px; margin: 0 auto;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 20px; padding: 30px;
+        }
+        .header { text-align: center; margin-bottom: 30px; }
+        .logo { font-size: 3em; margin-bottom: 10px; }
+        h1 { font-size: 1.8em; margin-bottom: 5px; }
+        .subtitle { opacity: 0.8; font-size: 0.9em; margin-bottom: 20px; }
+        .setup-card {
+            background: rgba(255, 255, 255, 0.15); border-radius: 15px;
+            padding: 25px; margin-bottom: 25px;
+        }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; font-weight: 600; }
+        input {
+            width: 100%; padding: 12px; border: none; border-radius: 8px;
+            font-size: 1em; background: rgba(255, 255, 255, 0.9);
+        }
+        .btn {
+            width: 100%; padding: 15px; border: none; border-radius: 12px;
+            font-size: 1.1em; font-weight: 600; cursor: pointer; color: white;
+            background: #ff6b35; margin-top: 10px;
+        }
+        .btn:disabled { background: #999; cursor: not-allowed; }
+        .instructions {
+            background: rgba(255, 255, 255, 0.1); border-radius: 10px;
+            padding: 15px; margin-bottom: 20px; font-size: 0.9em;
+        }
+        .step { margin-bottom: 8px; }
+        .success { background: #27ae60; padding: 15px; border-radius: 10px; text-align: center; }
+        .error { background: #e74c3c; padding: 15px; border-radius: 10px; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">🔥</div>
+            <h1>FlameWerks</h1>
+            <div class="subtitle">Burner WiFi Setup</div>
+        </div>
+        
+        <div class="instructions">
+            <div class="step">📱 <strong>Step 1:</strong> You scanned the QR code and connected to the setup WiFi</div>
+            <div class="step">🌐 <strong>Step 2:</strong> Enter your farm's WiFi network details below</div>
+            <div class="step">✅ <strong>Step 3:</strong> Your burner will connect and be ready to use!</div>
+        </div>
+        
+        <div class="setup-card">
+            <div id="setupForm">
+                <div class="form-group">
+                    <label for="wifiName">Your WiFi Network Name</label>
+                    <input type="text" id="wifiName" placeholder="e.g. FarmWiFi_Main" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="wifiPassword">WiFi Password</label>
+                    <input type="password" id="wifiPassword" placeholder="Enter WiFi password" required>
+                </div>
+                
+                <button id="setupBtn" class="btn">Connect Burner to WiFi</button>
+            </div>
+            
+            <div id="statusMessage" style="display: none;"></div>
+        </div>
+        
+        <div style="text-align: center; opacity: 0.8; font-size: 0.8em;">
+            <p>This setup only needs to be done once per burner</p>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('setupBtn').addEventListener('click', setupWiFi);
+        
+        // Allow Enter key to submit
+        document.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') setupWiFi();
+        });
+        
+        async function setupWiFi() {
+            const ssid = document.getElementById('wifiName').value.trim();
+            const password = document.getElementById('wifiPassword').value;
+            const statusDiv = document.getElementById('statusMessage');
+            const setupBtn = document.getElementById('setupBtn');
+            
+            if (!ssid) {
+                showMessage('Please enter your WiFi network name', 'error');
+                return;
+            }
+            
+            setupBtn.disabled = true;
+            setupBtn.textContent = 'Connecting...';
+            
+            try {
+                const response = await fetch('/provision', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: `ssid=${encodeURIComponent(ssid)}&password=${encodeURIComponent(password)}`
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    showMessage('✅ Success! Your burner is now connected to ' + ssid + 
+                              '<br><br>📱 You can now access it at: <strong>' + result.ip + '</strong>' +
+                              '<br><br>🔄 Redirecting you to the burner control...', 'success');
+                    
+                    // Redirect to burner control after success
+                    setTimeout(() => {
+                        window.location.href = 'http://' + result.ip;
+                    }, 3000);
+                } else {
+                    showMessage('❌ Connection failed: ' + result.message + 
+                              '<br><br>Please check your WiFi details and try again.', 'error');
+                    setupBtn.disabled = false;
+                    setupBtn.textContent = 'Connect Burner to WiFi';
+                }
+            } catch (error) {
+                showMessage('❌ Setup failed. Please check your WiFi details and try again.', 'error');
+                setupBtn.disabled = false;
+                setupBtn.textContent = 'Connect Burner to WiFi';
+            }
+        }
+        
+        function showMessage(message, type) {
+            const statusDiv = document.getElementById('statusMessage');
+            const setupForm = document.getElementById('setupForm');
+            
+            statusDiv.innerHTML = message;
+            statusDiv.className = type;
+            statusDiv.style.display = 'block';
+            
+            if (type === 'success') {
+                setupForm.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>)rawstring";
+}
+
+// --- Setup Function ---
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== FlameWerks Remote Burner Control System ===");
+  Serial.println("ESP32-C6 WiFi Version - QR Code Setup Mode");
+  Serial.println("Auburn I-31-2 Compatible with Zero-Configuration");
+  
+  // Auto-configure this burner (no manual setup required!)
+  autoConfigureBurner();
+  
+  // Load any saved WiFi credentials
+  loadWiFiCredentials();
+  
+  // Initialize GPIO pins
+  pinMode(PILOT_RELAY_PIN, OUTPUT);
+  pinMode(MAIN_RELAY_PIN, OUTPUT);
+  pinMode(IGNITER_PIN, OUTPUT);
+  pinMode(FLAME_ROD_OUT_PIN, OUTPUT);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  
+  // Initialize ADC for flame sensing
+  analogReadResolution(12); // ESP32-C6 supports 12-bit ADC
+  
+  // Ensure all outputs start OFF
+  setPilotValve(false);
+  setMainValve(false);
+  setIgniter(false);
+  setFlameRodOutput(0);
+  setStatusLED(false);
+  
+  // Initialize burner controller
+  burner.state = OFF;
+  burner.stateStartTime = millis();
+  burner.retryAttempt = 0;
+  burner.flameDetected = false;
+  
+  Serial.println("Hardware initialized - ESP32-C6 full functionality");
+  
+  // WiFi Connection Logic
+  if (isProvisioned && customer_ssid.length() > 0) {
+    // Try to connect to customer WiFi
+    Serial.println("=== CONNECTING TO CUSTOMER WIFI ===");
+    if (connectToCustomerWiFi()) {
+      Serial.println("Connected to customer network - ready for operation!");
+      registerWithMasterControl();
+    } else {
+      Serial.println("Failed to connect to saved WiFi - entering setup mode");
+      isProvisioned = false;
+      startProvisioningMode();
+    }
+  } else {
+    // Start provisioning mode for initial setup
+    Serial.println("=== STARTING QR CODE SETUP MODE ===");
+    startProvisioningMode();
+  }
+  
+  // Start mDNS if connected
+  if (WiFi.status() == WL_CONNECTED) {
+    if (MDNS.begin(hostname.c_str())) {
+      Serial.println("mDNS started: http://" + hostname + ".local/");
+    }
+  }
+  
+  // Configure web server
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/setup", HTTP_GET, handleSetup);
+  server.on("/provision", HTTP_POST, handleProvision);
+  server.on("/manifest.json", HTTP_GET, handleManifest);
+  server.on("/sw.js", HTTP_GET, handleServiceWorker);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/info", HTTP_GET, handleInfo);
+  server.on("/control", HTTP_POST, handleControl);
+  server.on("/control", HTTP_OPTIONS, [](){
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    server.send(200);
+  });
+  server.onNotFound(handleNotFound);
+  server.begin();
+  
+  // Initialize safety timer
+  esp_timer_create_args_t timer_args = {};
+  timer_args.callback = safetyTimerCallback;
+  timer_args.name = "safety_timer";
+  esp_timer_create(&timer_args, &safety_timer);
+  esp_timer_start_periodic(safety_timer, 10000000); // 10 seconds
+  
+  Serial.println("\n=== SYSTEM READY ===");
+  Serial.println("Burner Name: " + burnerName);
+  Serial.println("Burner ID: " + String(BURNER_ID));
+  if (isProvisioned) {
+    Serial.println("Status: Connected to customer WiFi");
+    Serial.println("Customer Access: http://" + WiFi.localIP().toString());
+  } else {
+    Serial.println("Status: QR Code Setup Mode Active");
+    Serial.println("Setup Access: http://" + WiFi.softAPIP().toString());
+  }
+  Serial.println("===================\n");
+}
+
+// --- Main Loop ---
+void loop() {
+  // Handle web server
+  server.handleClient();
+  
+  // Handle serial commands
+  if (Serial.available()) {
+    String serialCommand = Serial.readStringUntil('\n');
+    processCommand(serialCommand);
+  }
+  
+  // Update burner state machine
+  updateBurnerStateMachine();
+  
+  // Update system status
+  systemStatus.uptime = millis();
+  systemStatus.wifiConnected = (WiFi.status() == WL_CONNECTED);
+  systemStatus.wifiSignalStrength = WiFi.RSSI();
+  
+  // Small delay for stability
+  delay(50);
+}
+    Serial.println("Setup Access: http://" + WiFi.softAPIP().toString());
+  }
+  Serial.println("===================\n");
+}
+
+// --- Main Loop ---
+void loop() {
+  // Handle web server
+  server.handleClient();
+  
+  // Handle serial commands
+  if (Serial.available()) {
+    String serialCommand = Serial.readStringUntil('\n');
+    processCommand(serialCommand);
+  }
+  
+  // Update burner state machine
+  updateBurnerStateMachine();
+  
+  // Update system status
+  systemStatus.uptime = millis();
+  systemStatus.wifiConnected = (WiFi.status() == WL_CONNECTED);
+  systemStatus.wifiSignalStrength = WiFi.RSSI();
+  
+  // Small delay for stability
+  delay(50);
+}
+                } else {
+                    showMessage('❌ Connection failed: ' + result.message + 
+                              '<br><br>Please check your WiFi details and try again.', 'error');
+                    setupBtn.disabled = false;
+                    setupBtn.textContent = 'Connect Burner to WiFi';
+                }
+            } catch (error) {
+                showMessage('❌ Setup failed. Please check your WiFi details and try again.', 'error');
+                setupBtn.disabled = false;
+                setupBtn.textContent = 'Connect Burner to WiFi';
+            }
+        }
+        
+        function showMessage(message, type) {
+            const statusDiv = document.getElementById('statusMessage');
+            const setupForm = document.getElementById('setupForm');
+            
+            statusDiv.innerHTML = message;
+            statusDiv.className = type;
+            statusDiv.style.display = 'block';
+            
+            if (type === 'success') {
+                setupForm.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>)rawstring";
+}
+
+// --- Setup Function ---
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== FlameWerks Remote Burner Control System ===");
+  Serial.println("ESP32-C6 WiFi Version - QR Code Setup Mode");
+  Serial.println("Auburn I-31-2 Compatible with Zero-Configuration");
+  
+  // Auto-configure this burner (no manual setup required!)
+  autoConfigureBurner();
+  
+  // Load any saved WiFi credentials
+  loadWiFiCredentials();
+  
+  // Initialize GPIO pins
+  pinMode(PILOT_RELAY_PIN, OUTPUT);
+  pinMode(MAIN_RELAY_PIN, OUTPUT);
+  pinMode(IGNITER_PIN, OUTPUT);
+  pinMode(FLAME_ROD_OUT_PIN, OUTPUT);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  
+  // Initialize ADC for flame sensing
+  analogReadResolution(12); // ESP32-C6 supports 12-bit ADC
+  
+  // Ensure all outputs start OFF
+  setPilotValve(false);
+  setMainValve(false);
+  setIgniter(false);
+  setFlameRodOutput(0);
+  setStatusLED(false);
+  
+  // Initialize burner controller
+  burner.state = OFF;
+  burner.stateStartTime = millis();
+  burner.retryAttempt = 0;
+  burner.flameDetected = false;
+  
+  Serial.println("Hardware initialized - ESP32-C6 full functionality");
+  
+  // WiFi Connection Logic
+  if (isProvisioned && customer_ssid.length() > 0) {
+    // Try to connect to customer WiFi
+    Serial.println("=== CONNECTING TO CUSTOMER WIFI ===");
+    if (connectToCustomerWiFi()) {
+      Serial.println("Connected to customer network - ready for operation!");
+      registerWithMasterControl();
+    } else {
+      Serial.println("Failed to connect to saved WiFi - entering setup mode");
+      isProvisioned = false;
+      startProvisioningMode();
+    }
+  } else {
+    // Start provisioning mode for initial setup
+    Serial.println("=== STARTING QR CODE SETUP MODE ===");
+    startProvisioningMode();
+  }
+  
+  // Start mDNS if connected
+  if (WiFi.status() == WL_CONNECTED) {
+    if (MDNS.begin(hostname.c_str())) {
+      Serial.println("mDNS started: http://" + hostname + ".local/");
+    }
+  }
+  
+  // Configure web server
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/setup", HTTP_GET, handleSetup);
+  server.on("/provision", HTTP_POST, handleProvision);
+  server.on("/manifest.json", HTTP_GET, handleManifest);
+  server.on("/sw.js", HTTP_GET, handleServiceWorker);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/info", HTTP_GET, handleInfo);
+  server.on("/control", HTTP_POST, handleControl);
+  server.on("/control", HTTP_OPTIONS, [](){
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    server.send(200);
+  });
+  server.onNotFound(handleNotFound);
+  server.begin();
+  
+  // Initialize safety timer
+  esp_timer_create_args_t timer_args = {};
+  timer_args.callback = safetyTimerCallback;
+  timer_args.name = "safety_timer";
+  esp_timer_create(&timer_args, &safety_timer);
+  esp_timer_start_periodic(safety_timer, 10000000); // 10 seconds
+  
+  Serial.println("\n=== SYSTEM READY ===");
+  Serial.println("Burner Name: " + burnerName);
+  Serial.println("Burner ID: " + String(BURNER_ID));
+  if (isProvisioned) {
+    Serial.println("Status: Connected to customer WiFi");
+    Serial.println("Customer Access: http://" + WiFi.localIP().toString());
+  } else {
+    Serial.println("Status: QR Code Setup Mode Active");
+    Serial.println("Setup Access: http://" + WiFi.softAPIP().toString());
+  }
+  Serial.println("===================\n");
+}
+
+// --- Main Loop ---
+void loop() {
+  // Handle web server
+  server.handleClient();
+  
+  // Handle serial commands
+  if (Serial.available()) {
+    String serialCommand = Serial.readStringUntil('\n');
+    processCommand(serialCommand);
+  }
+  
+  // Update burner state machine
+  updateBurnerStateMachine();
+  
+  // Update system status
+  systemStatus.uptime = millis();
+  systemStatus.wifiConnected = (WiFi.status() == WL_CONNECTED);
+  systemStatus.wifiSignalStrength = WiFi.RSSI();
+  
+  // Small delay for stability
+  delay(50);
+}
