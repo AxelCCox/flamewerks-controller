@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FlameWorks Controller</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+            touch-action: manipulation;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+
+        .header {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .header h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+        }
+
+        .system-info {
+            font-size: 0.9rem;
+            opacity: 0.8;
+        }
+
+        .connection-status {
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+
+        .connected {
+            background: rgba(46, 204, 113, 0.9);
+        }
+
+        .disconnected {
+            background: rgba(231, 76, 60, 0.9);
+        }
+
+        .main-container {
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .control-panel {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 25px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .master-controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 25px;
+            flex-wrap: wrap;
+        }
+
+        .master-switch {
+            flex: 2;
+            min-width: 200px;
+        }
+
+        .emergency-stop {
+            flex: 1;
+            min-width: 120px;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 18px 25px;
+            border: none;
+            border-radius: 15px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+
+        .btn-master-on {
+            background: linear-gradient(45deg, #ff6b35, #f7931e);
+            color: white;
+        }
+
+        .btn-master-off {
+            background: linear-gradient(45deg, #95a5a6, #7f8c8d);
+            color: white;
+        }
+
+        .btn-emergency {
+            background: linear-gradient(45deg, #e74c3c, #c0392b);
+            color: white;
+            font-size: 1rem;
+        }
+
+        .btn:active {
+            transform: translateY(2px);
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .burner-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .burner-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            transition: all 0.3s ease;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .burner-card.selected {
+            border-color: #ff6b35;
+            background: rgba(255, 107, 53, 0.2);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(255, 107, 53, 0.3);
+        }
+
+        .burner-card.ignited {
+            animation: flame-flicker 2s infinite alternate;
+        }
+
+        .burner-card.fault {
+            border-color: #e74c3c;
+            background: rgba(231, 76, 60, 0.2);
+        }
+
+        @keyframes flame-flicker {
+            0% { 
+                box-shadow: 0 8px 25px rgba(255, 107, 53, 0.4);
+                transform: translateY(-2px) scale(1);
+            }
+            100% { 
+                box-shadow: 0 12px 30px rgba(255, 107, 53, 0.6);
+                transform: translateY(-2px) scale(1.02);
+            }
+        }
+
+        .burner-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .burner-title {
+            font-size: 1.3rem;
+            font-weight: bold;
+        }
+
+        .burner-status {
+            padding: 5px 12px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .status-off { background: rgba(149, 165, 166, 0.8); }
+        .status-igniting { background: rgba(241, 196, 15, 0.8); animation: pulse 1s infinite; }
+        .status-on { background: rgba(46, 204, 113, 0.8); }
+        .status-fault { background: rgba(231, 76, 60, 0.8); }
+        .status-emergency { background: rgba(192, 57, 43, 0.9); }
+
+        @keyframes pulse {
+            0% { opacity: 0.7; }
+            50% { opacity: 1; }
+            100% { opacity: 0.7; }
+        }
+
+        .burner-info {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin: 15px 0;
+        }
+
+        .info-item {
+            text-align: center;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+        }
+
+        .info-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .info-label {
+            font-size: 0.8rem;
+            opacity: 0.8;
+        }
+
+        .temperature.hot {
+            color: #ff6b35;
+        }
+
+        .burner-controls {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        .btn-burner {
+            flex: 1;
+            padding: 12px 15px;
+            font-size: 0.9rem;
+            border-radius: 10px;
+        }
+
+        .btn-ignite {
+            background: linear-gradient(45deg, #ff6b35, #f7931e);
+            color: white;
+        }
+
+        .btn-shutdown {
+            background: linear-gradient(45deg, #e74c3c, #c0392b);
+            color: white;
+        }
+
+        .selection-helper {
+            text-align: center;
+            margin: 20px 0;
+            padding: 15px;
+            background: rgba(52, 152, 219, 0.2);
+            border-radius: 10px;
+            border: 1px solid rgba(52, 152, 219, 0.3);
+        }
+
+        .log-panel {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 15px;
+            padding: 20px;
+            margin-top: 20px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .log-entry {
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+        }
+
+        .log-timestamp {
+            color: #3498db;
+            margin-right: 10px;
+        }
+
+        .error-message {
+            background: rgba(231, 76, 60, 0.2);
+            border: 1px solid rgba(231, 76, 60, 0.5);
+            border-radius: 10px;
+            padding: 15px;
+            margin: 10px 0;
+            text-align: center;
+        }
+
+        @media (max-width: 768px) {
+            .main-container {
+                padding: 15px;
+            }
+            
+            .master-controls {
+                flex-direction: column;
+            }
+            
+            .burner-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .header {
+                flex-direction: column;
+                gap: 10px;
+            }
+        }
+
+        .drag-selection {
+            position: absolute;
+            border: 2px dashed #ff6b35;
+            background: rgba(255, 107, 53, 0.1);
+            pointer-events: none;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>🔥 FlameWorks Controller</h1>
+            <div class="system-info" id="systemInfo">ESP32-C6 Burner System</div>
+        </div>
+        <div class="connection-status" id="connectionStatus">Connecting...</div>
+    </div>
+
+    <div class="main-container">
+        <!-- Control Panel -->
+        <div class="control-panel">
+            <div class="master-controls">
+                <div class="master-switch">
+                    <button class="btn btn-master-off" id="masterBtn" onclick="toggleMasterSwitch()">
+                        Master Control: OFF
+                    </button>
+                </div>
+                <div class="emergency-stop">
+                    <button class="btn btn-emergency" onclick="emergencyStop()">
+                        🚨 E-STOP
+                    </button>
+                </div>
+            </div>
+
+            <div class="selection-helper" id="selectionHelper">
+                Tap burners to select, then use Master Control to ignite/shutdown selected burners
+            </div>
+        </div>
+
+        <!-- Burner Grid -->
+        <div class="burner-grid" id="burnerGrid">
+            <!-- Burners will be populated by JavaScript -->
+        </div>
+
+        <!-- System Log -->
+        <div class="log-panel">
+            <h3>System Log</h3>
+            <div id="logContainer">
+                <div class="log-entry">
+                    <span class="log-timestamp">00:00:00</span>
+                    FlameWorks ESP32-C6 system initialized
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // System state
+        let socket;
+        let isConnected = false;
+        let systemState = {
+            systemId: '',
+            masterSwitch: false,
+            emergencyStop: false,
+            activeBurners: 1,
+            burners: []
+        };
+        let selectedBurners = new Set();
+
+        // Burner state constants
+        const BURNER_STATES = {
+            0: { name: 'OFF', class: 'status-off' },
+            1: { name: 'PILOT IGNITING', class: 'status-igniting' },
+            2: { name: 'PILOT ON', class: 'status-igniting' },
+            3: { name: 'MAIN IGNITING', class: 'status-igniting' },
+            4: { name: 'MAIN ON', class: 'status-on' },
+            5: { name: 'FAULT', class: 'status-fault' },
+            6: { name: 'E-STOP', class: 'status-emergency' }
+        };
+
+        // Initialize WebSocket connection
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            socket = new WebSocket(protocol + '//' + window.location.hostname + ':81');
+            
+            socket.onopen = function(event) {
+                isConnected = true;
+                updateConnectionStatus();
+                addLogEntry('Connected to FlameWorks ESP32-C6 system');
+            };
+            
+            socket.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                updateSystemState(data);
+            };
+            
+            socket.onclose = function(event) {
+                isConnected = false;
+                updateConnectionStatus();
+                addLogEntry('Connection lost, attempting reconnect...');
+                setTimeout(connectWebSocket, 3000);
+            };
+            
+            socket.onerror = function(error) {
+                addLogEntry('Connection error: ' + error);
+            };
+        }
+
+        // Update system state
+        function updateSystemState(data) {
+            systemState = { ...systemState, ...data };
+            updateUI();
+            
+            if (data.welcome) {
+                addLogEntry('System status received - ' + systemState.activeBurners + ' burners active');
+            }
+        }
+
+        // Update UI elements
+        function updateUI() {
+            // System info
+            document.getElementById('systemInfo').textContent = 
+                `${systemState.systemId} - ${systemState.activeBurners} Burners`;
+            
+            // Master switch
+            const masterBtn = document.getElementById('masterBtn');
+            if (systemState.masterSwitch) {
+                masterBtn.className = 'btn btn-master-on';
+                masterBtn.textContent = 'Master Control: ON';
+            } else {
+                masterBtn.className = 'btn btn-master-off';
+                masterBtn.textContent = 'Master Control: OFF';
+            }
+            
+            // Emergency stop state
+            if (systemState.emergencyStop) {
+                document.body.style.filter = 'hue-rotate(0deg) saturate(1.5)';
+                showEmergencyMessage();
+            } else {
+                document.body.style.filter = 'none';
+                hideEmergencyMessage();
+            }
+            
+            // Update burner grid
+            updateBurnerGrid();
+            
+            // Update selection helper
+            updateSelectionHelper();
+        }
+
+        // Update burner grid
+        function updateBurnerGrid() {
+            const grid = document.getElementById('burnerGrid');
+            grid.innerHTML = '';
+            
+            for (let i = 0; i < systemState.activeBurners; i++) {
+                const burner = systemState.burners[i] || {
+                    id: i + 1,
+                    state: 0,
+                    selected: false,
+                    temperature: 20,
+                    fault: false,
+                    error: ''
+                };
+                
+                const card = createBurnerCard(burner);
+                grid.appendChild(card);
+            }
+        }
+
+        // Create burner card
+        function createBurnerCard(burner) {
+            const card = document.createElement('div');
+            card.className = 'burner-card';
+            card.onclick = () => toggleBurnerSelection(burner.id);
+            
+            // Add state-based classes
+            if (selectedBurners.has(burner.id)) {
+                card.classList.add('selected');
+            }
+            if (burner.state === 4) { // MAIN_ON
+                card.classList.add('ignited');
+            }
+            if (burner.fault) {
+                card.classList.add('fault');
+            }
+            
+            const state = BURNER_STATES[burner.state] || BURNER_STATES[0];
+            
+            card.innerHTML = `
+                <div class="burner-header">
+                    <div class="burner-title">Burner ${burner.id}</div>
+                    <div class="burner-status ${state.class}">${state.name}</div>
+                </div>
+                
+                <div class="burner-info">
+                    <div class="info-item">
+                        <div class="info-value temperature ${burner.temperature > 100 ? 'hot' : ''}">${burner.temperature}°F</div>
+                        <div class="info-label">Temperature</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-value">${burner.fault ? '⚠️' : '✅'}</div>
+                        <div class="info-label">${burner.fault ? 'Fault' : 'Normal'}</div>
+                    </div>
+                </div>
+                
+                ${burner.error ? `<div class="error-message">${burner.error}</div>` : ''}
+                
+                <div class="burner-controls">
+                    <button class="btn btn-burner btn-ignite" onclick="igniteBurner(${burner.id})" 
+                            ${burner.state !== 0 || systemState.emergencyStop ? 'disabled' : ''}>
+                        🔥 Ignite
+                    </button>
+                    <button class="btn btn-burner btn-shutdown" onclick="shutdownBurner(${burner.id})"
+                            ${burner.state === 0 || systemState.emergencyStop ? 'disabled' : ''}>
+                        🛑 Shutdown
+                    </button>
+                </div>
+            `;
+            
+            return card;
+        }
+
+        // Burner selection
+        function toggleBurnerSelection(burnerId) {
+            if (selectedBurners.has(burnerId)) {
+                selectedBurners.delete(burnerId);
+            } else {
+                selectedBurners.add(burnerId);
+            }
+            
+            // Send selection to ESP32
+            if (socket && isConnected) {
+                const command = {
+                    action: 'select',
+                    burnerIds: Array.from(selectedBurners)
+                };
+                socket.send(JSON.stringify(command));
+            }
+            
+            updateBurnerGrid();
+            addLogEntry(`Selected burners: ${Array.from(selectedBurners).join(', ')}`);
+        }
+
+        // Master switch control
+        function toggleMasterSwitch() {
+            if (systemState.emergencyStop) return;
+            
+            const newState = !systemState.masterSwitch;
+            
+            if (socket && isConnected) {
+                const command = {
+                    action: newState ? 'master_on' : 'master_off'
+                };
+                socket.send(JSON.stringify(command));
+            }
+            
+            addLogEntry(`Master switch ${newState ? 'ON' : 'OFF'}`);
+        }
+
+        // Individual burner controls
+        function igniteBurner(burnerId) {
+            if (systemState.emergencyStop) return;
+            
+            if (socket && isConnected) {
+                const command = {
+                    action: 'ignite',
+                    burnerId: burnerId
+                };
+                socket.send(JSON.stringify(command));
+            }
+            
+            addLogEntry(`Igniting burner ${burnerId}`);
+        }
+
+        function shutdownBurner(burnerId) {
+            if (socket && isConnected) {
+                const command = {
+                    action: 'shutdown',
+                    burnerId: burnerId
+                };
+                socket.send(JSON.stringify(command));
+            }
+            
+            addLogEntry(`Shutting down burner ${burnerId}`);
+        }
+
+        // Emergency stop
+        function emergencyStop() {
+            if (socket && isConnected) {
+                const command = { action: 'emergency_stop' };
+                socket.send(JSON.stringify(command));
+            }
+            
+            addLogEntry('🚨 EMERGENCY STOP ACTIVATED');
+        }
+
+        // UI helper functions
+        function updateConnectionStatus() {
+            const statusElement = document.getElementById('connectionStatus');
+            
+            if (isConnected) {
+                statusElement.textContent = '● Connected';
+                statusElement.className = 'connection-status connected';
+            } else {
+                statusElement.textContent = '● Disconnected';
+                statusElement.className = 'connection-status disconnected';
+            }
+        }
+
+        function updateSelectionHelper() {
+            const helper = document.getElementById('selectionHelper');
+            
+            if (selectedBurners.size === 0) {
+                helper.textContent = 'Tap burners to select, then use Master Control';
+            } else {
+                helper.textContent = `Selected: ${Array.from(selectedBurners).join(', ')} - Use Master Control to ignite/shutdown`;
+            }
+        }
+
+        function addLogEntry(message) {
+            const logContainer = document.getElementById('logContainer');
+            const timestamp = new Date().toLocaleTimeString();
+            
+            const logEntry = document.createElement('div');
+            logEntry.className = 'log-entry';
+            logEntry.innerHTML = `<span class="log-timestamp">${timestamp}</span>${message}`;
+            
+            logContainer.appendChild(logEntry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+            
+            // Keep only last 20 entries
+            const entries = logContainer.children;
+            if (entries.length > 20) {
+                logContainer.removeChild(entries[0]);
+            }
+        }
+
+        function showEmergencyMessage() {
+            let emergencyDiv = document.getElementById('emergencyMessage');
+            if (!emergencyDiv) {
+                emergencyDiv = document.createElement('div');
+                emergencyDiv.id = 'emergencyMessage';
+                emergencyDiv.style.cssText = `
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    background: rgba(231, 76, 60, 0.9);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    z-index: 9999;
+                    font-size: 3rem;
+                    font-weight: bold;
+                    text-align: center;
+                    animation: pulse 1s infinite;
+                `;
+                emergencyDiv.innerHTML = '🚨 EMERGENCY STOP ACTIVE 🚨<br><small style="font-size: 1rem;">System shutdown - Reset required</small>';
+                document.body.appendChild(emergencyDiv);
+            }
+        }
+
+        function hideEmergencyMessage() {
+            const emergencyDiv = document.getElementById('emergencyMessage');
+            if (emergencyDiv) {
+                emergencyDiv.remove();
+            }
+        }
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            addLogEntry('FlameWorks Controller interface loaded');
+            connectWebSocket();
+            
+            // Keep connection alive
+            setInterval(function() {
+                if (socket && isConnected) {
+                    socket.send('ping');
+                }
+            }, 30000);
+        });
+    </script>
+</body>
+</html>
