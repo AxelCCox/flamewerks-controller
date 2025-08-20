@@ -1,0 +1,29 @@
+# EAS Build ignore patterns (root)
+/android
+/ios
+
+# Common dev artifacts
+node_modules/
+.vscode/
+.idea/
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Temp directories that cause permission issues
+.tmp/
+temp/
+.eas-tmp-*/
+.tmp-*/
+**/.git_disabled/
+**/temp/
+**/.tmp/
+
+# Build cache
+.expo/
+.eas/
+node_modules/.cache/
+android/.gradle/
+ios/.xcodebuild/

@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="700" viewBox="0 0 1100 700">
+  <title>FlameWerks Flame Sensing TIA (LMP7721) to ESP32‑C6 A1</title>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333" />
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill:#111; }
+      .lbl { font-size:14px; }
+      .small { font-size:12px; }
+      .node { fill:#fff; stroke:#222; stroke-width:2; }
+      .bus { stroke:#333; stroke-width:2; fill:none; }
+      .gnd { stroke:#333; stroke-width:2; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="550" y="30" text-anchor="middle" style="font-size:22px; font-weight:bold;">FlameWerks Flame Sensing Front‑End</text>
+  <text x="550" y="52" text-anchor="middle" class="small">LMP7721 TIA → RC filter → ESP32‑C6 A1 (GPIO1/ADC1_CH1)</text>
+
+  <!-- Flame rod and input network -->
+  <rect x="40" y="120" width="140" height="50" class="node"/>
+  <text x="110" y="150" text-anchor="middle" class="lbl">Flame Rod</text>
+
+  <!-- 100k resistor -->
+  <line x1="180" y1="145" x2="255" y2="145" class="bus"/>
+  <rect x="255" y="130" width="80" height="30" class="node"/>
+  <text x="295" y="150" text-anchor="middle" class="lbl">100 kΩ</text>
+
+  <!-- Input node -->
+  <circle cx="375" cy="145" r="4" fill="#333" />
+  <text x="360" y="125" class="small">Input node</text>
+
+  <!-- BAT85 to GND -->
+  <line x1="375" y1="145" x2="375" y2="205" class="bus"/>
+  <polygon points="368,175 382,175 375,165" fill="#666"/>
+  <text x="390" y="180" class="small">BAT85</text>
+  <line x1="375" y1="205" x2="375" y2="230" class="gnd"/>
+  <line x1="355" y1="230" x2="395" y2="230" class="gnd"/>
+  <line x1="365" y1="230" x2="375" y2="245" class="gnd"/>
+  <line x1="375" y1="245" x2="385" y2="230" class="gnd"/>
+  <text x="400" y="245" class="small">GND</text>
+
+  <!-- LMP7721 symbol block -->
+  <rect x="460" y="90" width="180" height="180" class="node"/>
+  <text x="550" y="110" text-anchor="middle" class="lbl">LMP7721</text>
+  <text x="470" y="140" class="small">IN+ (1)</text>
+  <text x="470" y="170" class="small">IN− (8)</text>
+  <text x="610" y="170" class="small">OUT (4)</text>
+  <text x="610" y="140" class="small">V− (3)</text>
+  <text x="610" y="200" class="small">V+ (6)</text>
+
+  <!-- IN+ to GND -->
+  <line x1="520" y1="138" x2="500" y2="138" class="bus"/>
+  <line x1="500" y1="138" x2="500" y2="210" class="bus"/>
+  <line x1="500" y1="210" x2="500" y2="235" class="gnd"/>
+  <line x1="480" y1="235" x2="520" y2="235" class="gnd"/>
+  <line x1="490" y1="235" x2="500" y2="250" class="gnd"/>
+  <line x1="500" y1="250" x2="510" y2="235" class="gnd"/>
+
+  <!-- IN- from input node -->
+  <line x1="375" y1="145" x2="460" y2="165" class="bus" marker-end="url(#arrow)"/>
+
+  <!-- OUT node to right -->
+  <line x1="640" y1="165" x2="760" y2="165" class="bus"/>
+  <circle cx="760" cy="165" r="4" fill="#333" />
+  <text x="760" y="150" text-anchor="middle" class="small">OUT</text>
+
+  <!-- Feedback R and C between OUT and IN- -->
+  <rect x="605" y="200" width="70" height="30" class="node"/>
+  <text x="640" y="220" text-anchor="middle" class="small">Rf 320 kΩ</text>
+  <line x1="640" y1="200" x2="640" y2="165" class="bus"/>
+  <line x1="640" y1="230" x2="640" y2="265" class="bus"/>
+  <line x1="640" y1="265" x2="480" y2="265" class="bus"/>
+  <line x1="480" y1="265" x2="480" y2="165" class="bus"/>
+  <rect x="555" y="280" width="50" height="16" class="node"/>
+  <text x="580" y="292" text-anchor="middle" class="small">Cf 10 pF</text>
+  <line x1="580" y1="280" x2="580" y2="165" class="bus"/>
+  <line x1="580" y1="296" x2="580" y2="165" class="bus"/>
+
+  <!-- V+ decoupling -->
+  <line x1="640" y1="200" x2="700" y2="200" class="bus"/>
+  <rect x="700" y="180" width="16" height="40" class="node"/>
+  <text x="718" y="190" class="small">0.1µF</text>
+  <line x1="708" y1="220" x2="708" y2="250" class="gnd"/>
+  <rect x="730" y="176" width="20" height="48" class="node"/>
+  <text x="740" y="190" class="small" text-anchor="middle">10µF</text>
+  <line x1="740" y1="224" x2="740" y2="254" class="gnd"/>
+  <text x="705" y="170" class="small">V+ 3.3 V</text>
+
+  <!-- RC to ADC node -->
+  <rect x="780" y="150" width="60" height="30" class="node"/>
+  <text x="810" y="170" text-anchor="middle" class="small">10 kΩ</text>
+  <line x1="760" y1="165" x2="780" y2="165" class="bus"/>
+  <line x1="840" y1="165" x2="900" y2="165" class="bus"/>
+  <circle cx="900" cy="165" r="4" fill="#333" />
+  <text x="900" y="150" text-anchor="middle" class="small">ADC node</text>
+  <rect x="885" y="185" width="30" height="40" class="node"/>
+  <text x="900" y="210" text-anchor="middle" class="small">0.1µF</text>
+  <line x1="900" y1="225" x2="900" y2="255" class="gnd"/>
+
+  <!-- ESP32-C6 box -->
+  <rect x="940" y="120" width="130" height="120" class="node"/>
+  <text x="1005" y="140" text-anchor="middle" class="lbl">ESP32‑C6</text>
+  <text x="955" y="165" class="small">A1 (GPIO1)</text>
+  <line x1="900" y1="165" x2="940" y2="165" class="bus" marker-end="url(#arrow)"/>
+  <text x="955" y="200" class="small">3V3, GND</text>
+
+  <!-- Notes -->
+  <text x="40" y="360" class="small">Notes:</text>
+  <text x="40" y="380" class="small">• IN+ (pin1) and V− (pin3) to GND. V+ (pin6) to 3.3 V. OUT (pin4) to RC/ADC.</text>
+  <text x="40" y="400" class="small">• Place Rf and Cf right at the op‑amp pins. Keep IN− trace short and clean.</text>
+  <text x="40" y="420" class="small">• BAT85 at input node (cathode at node, anode to GND) to clamp negative spikes.</text>
+  <text x="40" y="440" class="small">• Recommended: guard ring around IN− connected to GND on PCB.</text>
+  <text x="40" y="460" class="small">• In firmware: 12‑bit ADC, IIR filter, adjustable threshold.</text>
+
+  <!-- Border -->
+  <rect x="10" y="10" width="1080" height="680" fill="none" stroke="#777" stroke-width="1"/>
+</svg>

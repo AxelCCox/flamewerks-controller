@@ -1,0 +1,37 @@
+--- adb starting (pid 25376) ---
+08-18 20:15:06.097 25376 21916 I adb     : main.cpp:66 Android Debug Bridge version 1.0.41
+08-18 20:15:06.097 25376 21916 I adb     : main.cpp:66 Version 36.0.0-13206524
+08-18 20:15:06.097 25376 21916 I adb     : main.cpp:66 Installed as C:\Users\AxelC\AppData\Local\Android\Sdk\platform-tools\adb.exe
+08-18 20:15:06.097 25376 21916 I adb     : main.cpp:66 Running on Windows 10.0.26100
+08-18 20:15:06.097 25376 21916 I adb     : main.cpp:66 
+08-18 20:15:06.153 25376 21916 I adb     : udp_socket.cpp:170 AdbUdpSocket fd=2052
+08-18 20:15:06.153 25376 21916 I adb     : udp_socket.cpp:170 AdbUdpSocket fd=2053
+08-18 20:15:06.153 25376 21916 I adb     : udp_socket.cpp:274 SetMulticastOutboundInterface for index=10
+08-18 20:15:06.154 25376 21916 I adb     : udp_socket.cpp:533 bind endpoint=0.0.0.0:5353
+08-18 20:15:06.154 25376 21916 I adb     : udp_socket.cpp:274 SetMulticastOutboundInterface for index=10
+08-18 20:15:06.154 25376 21916 I adb     : udp_socket.cpp:558 bind endpoint=[0000:0000:0000:0000:0000:0000:0000:0000]:5353 scope_id=0
+08-18 20:15:06.155 25376 21916 I adb     : udp_socket.cpp:170 AdbUdpSocket fd=2054
+08-18 20:15:06.155 25376 21916 I adb     : udp_socket.cpp:170 AdbUdpSocket fd=2055
+08-18 20:15:06.155 25376 21916 I adb     : udp_socket.cpp:274 SetMulticastOutboundInterface for index=2
+08-18 20:15:06.155 25376 21916 I adb     : udp_socket.cpp:533 bind endpoint=0.0.0.0:5353
+08-18 20:15:06.155 25376 21916 I adb     : udp_socket.cpp:274 SetMulticastOutboundInterface for index=2
+08-18 20:15:06.155 25376 21916 I adb     : udp_socket.cpp:558 bind endpoint=[0000:0000:0000:0000:0000:0000:0000:0000]:5353 scope_id=0
+adb server killed by remote request
+--- adb starting (pid 42432) ---
+08-18 20:24:58.134 42432 40152 I adb     : main.cpp:66 Android Debug Bridge version 1.0.41
+08-18 20:24:58.134 42432 40152 I adb     : main.cpp:66 Version 36.0.0-13206524
+08-18 20:24:58.134 42432 40152 I adb     : main.cpp:66 Installed as C:\Users\AxelC\AppData\Local\Android\Sdk\platform-tools\adb.exe
+08-18 20:24:58.134 42432 40152 I adb     : main.cpp:66 Running on Windows 10.0.26100
+08-18 20:24:58.134 42432 40152 I adb     : main.cpp:66 
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:170 AdbUdpSocket fd=2052
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:170 AdbUdpSocket fd=2053
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:274 SetMulticastOutboundInterface for index=10
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:533 bind endpoint=0.0.0.0:5353
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:274 SetMulticastOutboundInterface for index=10
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:558 bind endpoint=[0000:0000:0000:0000:0000:0000:0000:0000]:5353 scope_id=0
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:170 AdbUdpSocket fd=2054
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:170 AdbUdpSocket fd=2055
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:274 SetMulticastOutboundInterface for index=2
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:533 bind endpoint=0.0.0.0:5353
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:274 SetMulticastOutboundInterface for index=2
+08-18 20:24:58.148 42432 40152 I adb     : udp_socket.cpp:558 bind endpoint=[0000:0000:0000:0000:0000:0000:0000:0000]:5353 scope_id=0
