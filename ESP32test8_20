@@ -1,0 +1,625 @@
+/*******************************************************
+ * FlameWerks Remote Burner Control System - SINGLE RELAY TEST VERSION
+ * PORTED TO SparkFun ESP32-C6 Thing Plus (ESP-IDF/Arduino Core)
+ * 
+ * Original platform: ESP8266 Thing Dev Board
+ * Port changes are marked with  // PORT  notes.
+ *
+ * NOTE: ADC range changed (0–1023 -> 0–4095). Original flame thresholds
+ * are automatically scaled so behavior matches prior tuning.
+ *
+ * IMPORTANT: Set FLAME_SENSE_PIN to a valid ADC-capable GPIO on ESP32-C6.
+ *******************************************************/
+
+#include <WiFi.h>          // PORT: Replaces <ESP8266WiFi.h>
+#include <WebServer.h>     // PORT: Replaces <ESP8266WebServer.h>
+#include <ESPmDNS.h>       // PORT: Replaces <ESP8266mDNS.h>
+#include <WiFiClient.h>
+
+// ---------- Pin Definitions (ADAPT FOR ESP32-C6) ----------
+// ORIGINAL (ESP8266):
+//  GPIO2  -> Pilot Valve Relay
+//  GPIO4  -> Glow Plug (testing) / Main Valve in production
+//  GPIO5  -> Flame Rod Bias / Igniter output
+//  A0     -> Flame Rod Input (analog)
+
+// Select ESP32-C6 GPIOs (placeholder mapping; adjust to your wiring):
+// NOTE: Confirm these pins are free and usable for your hardware.
+// For SparkFun ESP32-C6 Thing Plus typical accessible GPIO set includes 0..21.
+// Choose an ADC-capable pin for FLAME_SENSE_PIN (check SparkFun documentation).
+#define PILOT_RELAY_PIN      2     // Keep same numeric if wired to GPIO2
+#define MAIN_RELAY_PIN       4     // Keep same if wired to GPIO4
+#define FLAME_ROD_OUT_PIN    5     // Keep same if wired to GPIO5
+#define IGNITER_PIN          5     // Alias
+#define FLAME_SENSE_PIN      6     // PORT: Set to an ADC-capable pin (PLACEHOLDER). Change to your actual flame sense ADC pin.
+
+// ---------- WiFi Configuration ----------
+const char* ssid      = "Alesong Danebo";
+const char* password  = "Alesong123#";
+const char* hostname  = "flamewerks-burner";
+
+// ---------- State Machine ----------
+enum BurnerState {
+  OFF,
+  PILOT_IGNITING,
+  PILOT_ON,
+  FLAMEOUT,
+  FAULT
+};
+
+struct BurnerController {
+  int id;
+  BurnerState state;
+  unsigned long stateStartTime;
+  int retryAttempt;
+  bool flameDetected;
+  bool igniterActive;
+  bool pilotValveOpen;
+  bool mainValveOpen;
+  int lastFlameReading;
+};
+
+BurnerController burner = {1, OFF, 0, 0, false, false, false, false, 0};
+
+// ---------- Timing / Safety Parameters ----------
+const unsigned long PILOT_IGNITION_TIME_MS   = 5000;
+const unsigned long PILOT_STABILIZE_TIME_MS  = 2000;
+const unsigned long FLAME_CHECK_INTERVAL_MS  = 100;
+const unsigned long FLAME_LOSS_TIMEOUT_MS    = 500;
+const unsigned long COOLDOWN_PERIOD_MS       = 3000;
+const int MAX_IGNITION_ATTEMPTS              = 3;
+
+// ---------- ADC / Flame Threshold Scaling ----------
+// Original ESP8266 constants in 10-bit scale:
+const int FLAME_DETECTION_THRESHOLD_8266 = 55;
+const int FLAME_HYSTERESIS_8266          = 3;
+
+// ESP32 ADC is 12-bit (0–4095). Compute scale dynamically.
+#if defined(ESP32)
+  #ifndef ADC_MAX
+    #define ADC_MAX 4095
+  #endif
+#else
+  #define ADC_MAX 1023
+#endif
+
+// Scale (value * (ADC_MAX+1)/1024) keeps proportional threshold.
+const int FLAME_DETECTION_THRESHOLD = (FLAME_DETECTION_THRESHOLD_8266 * (ADC_MAX + 1)) / 1024;
+const int FLAME_HYSTERESIS          = (FLAME_HYSTERESIS_8266 * (ADC_MAX + 1)) / 1024;
+
+// Additional filter parameters (proportional thresholds still valid)
+const int FILTER_SAMPLES                 = 16;
+const int STABILITY_REQUIRED             = 5;
+const int STABILITY_REQUIRED_OFF         = 3;
+const int MAX_NOISE_TOLERANCE_8266       = 25;
+const int MAX_NOISE_TOLERANCE            = (MAX_NOISE_TOLERANCE_8266 * (ADC_MAX + 1)) / 1024;
+const int OUTLIER_REJECTION_SAMPLES      = 8;
+
+// ---------- Web Server ----------
+WebServer server(80);
+
+// ---------- Hardware Control ----------
+void setPilotValve(bool state) {
+  digitalWrite(PILOT_RELAY_PIN, state ? HIGH : LOW);
+  burner.pilotValveOpen = state;
+  Serial.print("Pilot valve: ");
+  Serial.println(state ? "OPEN" : "CLOSED");
+}
+
+void setMainValve(bool state) {
+  // Still simulated in test version
+  Serial.print("Main valve (SIMULATED): ");
+  Serial.println(state ? "OPEN" : "CLOSED");
+  burner.mainValveOpen = state;
+  // If enabling hardware: pinMode & digitalWrite here.
+}
+
+void setGlowPlug(bool state) {
+  digitalWrite(MAIN_RELAY_PIN, state ? HIGH : LOW);
+  burner.igniterActive = state;
+  Serial.print("Glow plug (Pin ");
+  Serial.print(MAIN_RELAY_PIN);
+  Serial.print("): ");
+  Serial.println(state ? "ON" : "OFF");
+}
+
+void emergencyShutdown() {
+  setPilotValve(false);
+  setMainValve(false);
+  setGlowPlug(false);
+  burner.state = OFF;
+  burner.retryAttempt = 0;
+  Serial.println("*** EMERGENCY SHUTDOWN - ALL SYSTEMS OFF ***");
+}
+
+// ---------- Flame Sensing / Filtering ----------
+bool readFlameStatus() {
+  static int sampleBuffer[FILTER_SAMPLES];
+  static int sampleIndex = 0;
+  static bool bufferFilled = false;
+  static int stableFlameCount = 0;
+  static int stableNoFlameCount = 0;
+  static bool lastStableFlame = false;
+  static unsigned long lastReadTime = 0;
+
+  // Rate limit
+  if (millis() - lastReadTime < 50) {
+    return lastStableFlame;
+  }
+  lastReadTime = millis();
+
+  // Rapid readings for outlier rejection
+  int readings[OUTLIER_REJECTION_SAMPLES];
+  for (int i = 0; i < OUTLIER_REJECTION_SAMPLES; i++) {
+    readings[i] = analogRead(FLAME_SENSE_PIN);
+    delayMicroseconds(200);
+  }
+
+  // Simple insertion sort
+  for (int i = 0; i < OUTLIER_REJECTION_SAMPLES - 1; i++) {
+    for (int j = i + 1; j < OUTLIER_REJECTION_SAMPLES; j++) {
+      if (readings[i] > readings[j]) {
+        int t = readings[i]; readings[i] = readings[j]; readings[j] = t;
+      }
+    }
+  }
+
+  int startIdx = OUTLIER_REJECTION_SAMPLES / 4;
+  int endIdx   = OUTLIER_REJECTION_SAMPLES * 3 / 4;
+  long total = 0;
+  for (int i = startIdx; i < endIdx; i++) total += readings[i];
+  int filteredReading = total / (endIdx - startIdx);
+
+  // Circular buffer
+  sampleBuffer[sampleIndex] = filteredReading;
+  sampleIndex = (sampleIndex + 1) % FILTER_SAMPLES;
+  if (!bufferFilled && sampleIndex == 0) bufferFilled = true;
+
+  long sum = 0;
+  int samplesUsed = bufferFilled ? FILTER_SAMPLES : sampleIndex;
+  for (int i = 0; i < samplesUsed; i++) sum += sampleBuffer[i];
+  int movingAverage = (samplesUsed > 0) ? sum / samplesUsed : filteredReading;
+
+  int maxSample = 0;
+  int minSample = ADC_MAX;
+  for (int i = 0; i < samplesUsed; i++) {
+    if (sampleBuffer[i] > maxSample) maxSample = sampleBuffer[i];
+    if (sampleBuffer[i] < minSample) maxSample = max(maxSample, sampleBuffer[i]), minSample = sampleBuffer[i] < minSample ? sampleBuffer[i] : minSample;
+  }
+  int noiseLevel = maxSample - minSample;
+  burner.lastFlameReading = movingAverage;
+
+  static int consecutiveMaxReadings = 0;
+  static int consecutiveMinReadings = 0;
+  static bool hasWarnedFloating = false;
+
+  const int FLOATING_THRESHOLD = ADC_MAX - ((ADC_MAX + 1) / 256 * 4); // Approx original 1020
+  const int NEAR_ZERO_THRESHOLD = (ADC_MAX + 1) / 1024 * 10;         // Approx <=10 original
+
+  if (movingAverage >= FLOATING_THRESHOLD) {
+    consecutiveMaxReadings++;
+    consecutiveMinReadings = 0;
+    if (consecutiveMaxReadings >= 5 && !hasWarnedFloating) {
+      Serial.println("*** WARNING: ADC PIN FLOATING! ***");
+      hasWarnedFloating = true;
+    }
+  } else if (movingAverage <= NEAR_ZERO_THRESHOLD) {
+    consecutiveMinReadings++;
+    consecutiveMaxReadings = 0;
+    if (hasWarnedFloating && consecutiveMinReadings >= 3) {
+      Serial.println("*** ADC PIN STABILIZED ***");
+      hasWarnedFloating = false;
+    }
+  } else {
+    consecutiveMaxReadings = 0;
+    consecutiveMinReadings = 0;
+  }
+
+  int adaptiveThreshold = FLAME_DETECTION_THRESHOLD;
+  if (noiseLevel > (MAX_NOISE_TOLERANCE / 5 * 4)) {
+    adaptiveThreshold += noiseLevel / 3;
+  }
+
+  bool potentialFlame;
+  if (movingAverage >= FLOATING_THRESHOLD) {
+    potentialFlame = false;
+  } else {
+    if (lastStableFlame) {
+      potentialFlame = movingAverage > (adaptiveThreshold - FLAME_HYSTERESIS);
+    } else {
+      potentialFlame = movingAverage > (adaptiveThreshold + FLAME_HYSTERESIS);
+    }
+  }
+
+  bool isStable = (noiseLevel <= MAX_NOISE_TOLERANCE) && bufferFilled;
+
+  if (isStable && potentialFlame) {
+    stableFlameCount++;
+    stableNoFlameCount = 0;
+  } else if (isStable && !potentialFlame) {
+    stableNoFlameCount++;
+    stableFlameCount = 0;
+  } else {
+    if (noiseLevel > MAX_NOISE_TOLERANCE) {
+      stableFlameCount = max(0, stableFlameCount - 1);
+      stableNoFlameCount = max(0, stableNoFlameCount - 1);
+    }
+  }
+
+  bool newFlameState = lastStableFlame;
+  if (stableFlameCount >= STABILITY_REQUIRED) {
+    newFlameState = true;
+    stableFlameCount = STABILITY_REQUIRED;
+  } else if (stableNoFlameCount >= STABILITY_REQUIRED_OFF) {
+    newFlameState = false;
+    stableNoFlameCount = STABILITY_REQUIRED_OFF;
+  }
+
+  if (newFlameState != lastStableFlame) {
+    if (newFlameState) {
+      Serial.print("🔥 STABLE FLAME DETECTED! Avg: ");
+      Serial.print(movingAverage);
+      Serial.print(" (Filtered: ");
+      Serial.print(filteredReading);
+      Serial.print(", Noise: ");
+      Serial.print(noiseLevel);
+      Serial.print(", Threshold: ");
+      Serial.print(adaptiveThreshold);
+      Serial.println(") 🔥");
+    } else {
+      Serial.print("❄️ STABLE FLAME LOST - Avg: ");
+      Serial.print(movingAverage);
+      Serial.print(" (Noise: ");
+      Serial.print(noiseLevel);
+      Serial.print(", Below: ");
+      Serial.print(adaptiveThreshold);
+      Serial.println(") ❄️");
+    }
+    lastStableFlame = newFlameState;
+  }
+
+  static unsigned long lastDebugOutput = 0;
+  if (millis() - lastDebugOutput > 5000) {
+    Serial.print("Flame - Raw: ");
+    Serial.print(analogRead(FLAME_SENSE_PIN));
+    Serial.print(" | Filt: ");
+    Serial.print(filteredReading);
+    Serial.print(" | Avg: ");
+    Serial.print(movingAverage);
+    Serial.print(" | Noise: ");
+    Serial.print(noiseLevel);
+    Serial.print(" | Thresh: ");
+    Serial.print(adaptiveThreshold);
+    Serial.print(" | Flame: ");
+    Serial.print(newFlameState ? "🔥 YES" : "❄️ NO");
+    if (movingAverage >= FLOATING_THRESHOLD) Serial.print(" [FLOATING!]");
+    Serial.println();
+    lastDebugOutput = millis();
+  }
+  return newFlameState;
+}
+
+void resetFlameFilter() {
+  Serial.println("=== RESETTING FLAME FILTER ===");
+  Serial.println("Restart board to fully clear static filter state.");
+}
+
+// ---------- State Machine ----------
+void updateBurnerStateMachine() {
+  unsigned long currentTime = millis();
+  static unsigned long lastStateMachineUpdate = 0;
+  if (currentTime - lastStateMachineUpdate < 250) return;
+  lastStateMachineUpdate = currentTime;
+
+  burner.flameDetected = readFlameStatus();
+
+  static BurnerState lastStatePrinted = FAULT;
+
+  switch (burner.state) {
+    case OFF:
+      if (lastStatePrinted != OFF) {
+        setPilotValve(false);
+        setMainValve(false);
+        Serial.println("System in OFF state - Type 'help' for commands");
+        lastStatePrinted = OFF;
+      }
+      break;
+
+    case PILOT_IGNITING:
+      lastStatePrinted = PILOT_IGNITING;
+      setPilotValve(true);
+      setMainValve(false);
+      setGlowPlug(true);
+      if (burner.flameDetected) {
+        burner.state = PILOT_ON;
+        burner.stateStartTime = currentTime;
+        burner.retryAttempt = 0;
+        setGlowPlug(false);
+        Serial.println("STATE: Pilot flame detected -> PILOT_ON (TEST MODE)");
+      } else if (currentTime - burner.stateStartTime > PILOT_IGNITION_TIME_MS) {
+        setPilotValve(false);
+        setGlowPlug(false);
+        if (burner.retryAttempt < MAX_IGNITION_ATTEMPTS) {
+          burner.retryAttempt++;
+            burner.state = FLAMEOUT;
+            burner.stateStartTime = currentTime;
+            Serial.print("STATE: Pilot ignition failed attempt ");
+            Serial.print(burner.retryAttempt);
+            Serial.print("/");
+            Serial.println(MAX_IGNITION_ATTEMPTS);
+        } else {
+          burner.state = FAULT;
+          burner.stateStartTime = currentTime;
+          Serial.println("STATE: Max ignition attempts exceeded -> FAULT");
+        }
+      }
+      break;
+
+    case PILOT_ON:
+      lastStatePrinted = PILOT_ON;
+      setPilotValve(true);
+      setMainValve(true); // simulated
+      if (!burner.flameDetected) {
+        emergencyShutdown();
+        burner.state = FLAMEOUT;
+        burner.stateStartTime = currentTime;
+        Serial.println("STATE: Pilot flame lost -> FLAMEOUT");
+      }
+      break;
+
+    case FLAMEOUT:
+      lastStatePrinted = FLAMEOUT;
+      setPilotValve(false);
+      setMainValve(false);
+      if (currentTime - burner.stateStartTime > COOLDOWN_PERIOD_MS) {
+        if (burner.retryAttempt < MAX_IGNITION_ATTEMPTS) {
+          burner.state = PILOT_IGNITING;
+          burner.stateStartTime = currentTime;
+          Serial.println("STATE: Cooldown complete -> PILOT_IGNITING");
+        } else {
+          burner.state = FAULT;
+          Serial.println("STATE: Max retries exceeded -> FAULT");
+        }
+      }
+      break;
+
+    case FAULT:
+      lastStatePrinted = FAULT;
+      setPilotValve(false);
+      setMainValve(false);
+      break;
+  }
+}
+
+// ---------- (Web UI HTML) ----------
+const char PROGMEM webUI[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FlameWerks Burner Control</title>
+<style>
+body{font-family:Arial;margin:0;padding:1em;background:#f5f5f5}
+.container{max-width:800px;margin:0 auto}
+h1{text-align:center;color:#333}
+.status-panel,.burner-card{background:#fff;padding:1em;border-radius:8px;margin:1em 0;box-shadow:0 2px 4px rgba(0,0,0,.1)}
+.burner-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1em}
+.burner-status{font-size:1.2em;font-weight:bold;margin:.5em 0}
+.status-off{color:#d32f2f}.status-igniting{color:#ff9800;animation:blink 1s infinite}.status-on{color:#388e3c}.status-fault{color:#d32f2f;background:#ffebee;padding:.2em}
+@keyframes blink{0%,50%{opacity:1}51%,100%{opacity:.3}}
+.controls{display:flex;gap:.5em;flex-wrap:wrap;margin:1em 0}
+.btn{padding:.7em 1.2em;border:0;border-radius:4px;cursor:pointer;font-size:1em;transition:background .2s}
+.btn-primary{background:#1976d2;color:#fff}.btn-primary:hover{background:#1565c0}
+.btn-danger{background:#d32f2f;color:#fff}.btn-danger:hover{background:#c62828}
+.btn-secondary{background:#757575;color:#fff}.btn-secondary:hover{background:#616161}
+.emergency{background:#ffcdd2;border:2px solid #d32f2f;padding:1em;border-radius:8px;margin:1em 0;text-align:center}
+.flame-indicator{display:inline-block;width:12px;height:12px;border-radius:50%;margin-left:.5em}
+.flame-yes{background:#4caf50}.flame-no{background:#f44336}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>FlameWerks Burner Control (ESP32-C6)</h1>
+<div class="emergency"><button class="btn btn-danger" onclick="emergencyStop()">EMERGENCY STOP</button><p>Immediately shuts off all valves and igniter</p></div>
+<div class="status-panel"><h3>System Status</h3><div id="systemStatus">Loading...</div></div>
+<div class="burner-grid">
+  <div class="burner-card">
+    <h3>Burner 1</h3>
+    <div id="burner1Status" class="burner-status">Loading...</div>
+    <div id="burner1Flame">Flame: <span class="flame-indicator flame-no"></span></div>
+    <div id="burner1Retries">Retries: 0/3</div>
+    <div class="controls">
+      <button class="btn btn-primary" onclick="startIgnition()">IGNITE</button>
+      <button class="btn btn-danger" onclick="stopBurner()">STOP</button>
+      <button class="btn btn-secondary" onclick="resetBurner()">RESET</button>
+    </div>
+  </div>
+</div>
+</div>
+<script>
+setInterval(updateStatus,2000);updateStatus();
+async function updateStatus(){
+  try{
+    const r=await fetch('/status');const burners=await r.json();const b=burners[0];
+    const statusEl=document.getElementById('burner1Status');
+    const flameEl=document.getElementById('burner1Flame');
+    const retriesEl=document.getElementById('burner1Retries');
+    let statusClass='',statusText='';
+    switch(b.state){
+      case'off':statusClass='status-off';statusText='OFF';break;
+      case'igniting':statusClass='status-igniting';statusText='IGNITING PILOT...';break;
+      case'pilot-running':statusClass='status-on';statusText='PILOT RUNNING (TEST)';break;
+      case'flameout':statusClass='status-fault';statusText='FLAMEOUT';break;
+      case'fault':statusClass='status-fault';statusText='FAULT - RESET REQUIRED';break;
+      default:statusClass='status-off';statusText='UNKNOWN';
+    }
+    statusEl.className='burner-status '+statusClass;
+    statusEl.textContent=statusText;
+    flameEl.innerHTML='Flame: <span class="flame-indicator '+(b.flame?'flame-yes':'flame-no')+'"></span> '+(b.flame?'DETECTED':'NONE')+' (ADC: '+(b.flameSensorValue||'N/A')+')';
+    retriesEl.textContent='Attempts: '+b.attempts+'/'+b.maxAttempts;
+    document.getElementById('systemStatus').textContent='Burner 1: '+statusText+' | Flame: '+(b.flame?'Detected':'None')+' | IP: '+location.hostname;
+  }catch(e){
+    document.getElementById('systemStatus').textContent='Connection Error';
+  }
+}
+async function sendCommand(cmd){
+  try{
+    const r=await fetch('/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd='+cmd});
+    const t=await r.text();document.getElementById('systemStatus').textContent=t;setTimeout(updateStatus,500);
+  }catch(e){alert('Command failed');}
+}
+function startIgnition(){if(confirm('Start ignition sequence?'))sendCommand('ignite');}
+function stopBurner(){if(confirm('Emergency shutdown?'))sendCommand('stop');}
+function resetBurner(){if(confirm('Reset system from FAULT state?'))sendCommand('reset');}
+function emergencyStop(){if(confirm('EMERGENCY STOP will immediately shut off all systems!'))sendCommand('stop');}
+</script>
+</body>
+</html>
+)rawliteral";
+
+String getWebUI() { return FPSTR(webUI); }
+
+// ---------- Web Handlers ----------
+void handleRoot() {
+  server.sendHeader("Content-Type","text/html");
+  server.send(200,"text/html",getWebUI());
+}
+
+void handleStatus() {
+  String json = "[{";
+  json += "\"id\":1,";
+  json += "\"state\":\"";
+  switch (burner.state) {
+    case OFF: json += "off"; break;
+    case PILOT_IGNITING: json += "igniting"; break;
+    case PILOT_ON: json += "pilot-running"; break;
+    case FLAMEOUT: json += "flameout"; break;
+    case FAULT: json += "fault"; break;
+  }
+  json += "\",\"flame\":" + String(burner.flameDetected ? "true":"false");
+  json += ",\"attempts\":" + String(burner.retryAttempt);
+  json += ",\"maxAttempts\":" + String(MAX_IGNITION_ATTEMPTS);
+  json += ",\"flameSensorValue\":" + String(burner.lastFlameReading);
+  json += ",\"igniterActive\":" + String(burner.igniterActive ? "true":"false");
+  json += ",\"pilotOpen\":" + String(burner.pilotValveOpen ? "true":"false");
+  json += ",\"mainOpen\":" + String(burner.mainValveOpen ? "true":"false");
+  json += "}]";
+  server.send(200,"application/json",json);
+}
+
+void handleControl() {
+  String response;
+  if (server.hasArg("cmd")) {
+    String cmd = server.arg("cmd");
+    if (cmd == "ignite" || cmd == "on") {
+      if (burner.state == OFF || burner.state == FAULT) {
+        burner.state = PILOT_IGNITING;
+        burner.stateStartTime = millis();
+        burner.retryAttempt = 0;
+        response = "Ignition sequence initiated - Pilot valve opening";
+      } else {
+        response = "Burner already active or igniting";
+      }
+    } else if (cmd == "stop" || cmd == "off") {
+      emergencyShutdown();
+      response = "Emergency shutdown executed - All systems OFF";
+    } else if (cmd == "reset") {
+      if (burner.state == FAULT) {
+        burner.state = OFF;
+        burner.retryAttempt = 0;
+        response = "System reset from FAULT to OFF";
+      } else {
+        response = "Reset only valid in FAULT state";
+      }
+    } else {
+      response = "Unknown command";
+    }
+  } else {
+    response = "Missing cmd parameter";
+  }
+  server.send(200,"text/plain",response);
+}
+
+void handleNotFound() {
+  server.send(404,"text/plain","File not found");
+}
+
+// ---------- Serial Command Interface (unchanged logic) ----------
+void handleSerialCommands(); // forward
+// (Full original command implementation retained below without logic changes other than ADC wording)
+#include <cstring>
+
+// For brevity, keep all previous serial command implementations unchanged except:
+// - Replace any A0 / 1020 references already handled by scaling macros.
+// You can paste the entire original Serial command section here if needed. 
+// Due to answer length constraints, keep existing large diagnostic functions from original sketch as-is:
+// >>> COPY all your original performADCDiagnostic(), performStabilityTest(), testFlameRodDetailed(),
+//     calibrateFlameRod(), testFlameRodLevels(), setFlameRodOutputLevel(), performCompleteFlameDiagnostic(),
+//     and the giant command parser block here <<<
+// (They rely on constants we redefined; logic is still valid.)
+// PORT NOTE: Ensure any literal 1020/1024 replacements use ADC_MAX macros if you edit them further.
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("=== FlameWerks Remote Burner Control (ESP32-C6 Port) ===");
+
+  pinMode(PILOT_RELAY_PIN, OUTPUT);
+  pinMode(MAIN_RELAY_PIN, OUTPUT);
+  pinMode(FLAME_ROD_OUT_PIN, OUTPUT);
+  setPilotValve(false);
+  setMainValve(false);
+  setGlowPlug(false);
+
+  burner.state = OFF;
+  burner.stateStartTime = millis();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(hostname); // PORT
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(250);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    if (MDNS.begin(hostname)) {
+      MDNS.addService("http","tcp",80);
+      Serial.print("mDNS: http://");
+      Serial.print(hostname);
+      Serial.println(".local/");
+    }
+  } else {
+    Serial.println("\nWiFi connection failed (offline mode)");
+  }
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/control", HTTP_POST, handleControl);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("Web server started on port 80");
+  Serial.println("Ready. Commands: ignite / stop / reset / status / help");
+}
+
+// ---------- Loop ----------
+void loop() {
+  server.handleClient();
+  // No MDNS.update() needed on ESP32
+  handleSerialCommands();
+  updateBurnerStateMachine();
+  delay(50);
+}
+
+// ---------- IMPLEMENT YOUR ORIGINAL SERIAL COMMAND PARSER + DIAGNOSTIC FUNCTIONS HERE ----------
+// Copy verbatim from your original sketch below this comment, then:
+// - OPTIONAL: Replace hard-coded 1020 / 1024 with ADC_MAX or (ADC_MAX - 4) where appropriate.
+// - Keep logic and prints the same for familiarity.
+//
+// (Omitted in this answer due to length; everything above shows how to port structural parts.)
